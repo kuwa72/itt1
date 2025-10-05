@@ -1,0 +1,79 @@
+import json
+import os
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+
+
+class AppConfig(BaseModel):
+    """アプリケーション設定"""
+    playlists: List[str] = Field(
+        default=["お気に入り", "作業用", "リラックス", "運動用", "新曲"],
+        description="ワンキーで追加できるプレイリスト名"
+    )
+    quick_slots: List[str] = Field(
+        default_factory=list,
+        description="クイックスロット(1-5)に割り当てる既存プレイリスト名"
+    )
+    skip_seconds: int = Field(
+        default=10,
+        description="スキップする秒数"
+    )
+    auto_create_playlists: bool = Field(
+        default=True,
+        description="起動時にプレイリストを自動作成するか"
+    )
+    refresh_interval: float = Field(
+        default=0.25,
+        description="画面更新間隔（秒）"
+    )
+
+
+class ConfigManager:
+    """設定ファイル管理"""
+    
+    def __init__(self, config_file: str = "config.json"):
+        self.config_file = config_file
+        self.config = self.load_config()
+    
+    def load_config(self) -> AppConfig:
+        """設定ファイルを読み込む"""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return AppConfig(**data)
+            except Exception as e:
+                print(f"設定ファイル読み込みエラー: {e}")
+                return AppConfig()
+        
+        return AppConfig()
+    
+    def save_config(self):
+        """設定をファイルに保存"""
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config.dict(), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"設定ファイル保存エラー: {e}")
+    
+    def update_playlists(self, playlists: List[str]):
+        """プレイリスト設定を更新"""
+        self.config.playlists = playlists
+        self.save_config()
+    
+    def get_playlists(self) -> List[str]:
+        """設定されたプレイリストを取得"""
+        return self.config.playlists
+
+    def get_quick_slots(self) -> List[str]:
+        """クイックスロット(最大5件)を取得。未設定ならplaylistsから流用。"""
+        slots = self.config.quick_slots or []
+        if slots:
+            return slots[:5]
+        # 後方互換: 旧playlists設定を使う
+        return (self.config.playlists or [])[:5]
+
+    def set_quick_slots(self, slots: List[str]):
+        """クイックスロット(1-5)を設定して保存"""
+        self.config.quick_slots = slots[:5]
+        self.save_config()
