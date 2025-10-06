@@ -12,7 +12,7 @@ class AppConfig(BaseModel):
     )
     quick_slots: List[str] = Field(
         default_factory=list,
-        description="クイックスロット(1-5)に割り当てる既存プレイリスト名"
+        description="クイックスロット(最大22: F1–F12, 0–9)に割り当てる既存プレイリスト名"
     )
     skip_seconds: int = Field(
         default=10,
@@ -66,14 +66,14 @@ class ConfigManager:
         return self.config.playlists
 
     def get_quick_slots(self) -> List[str]:
-        """クイックスロット(最大5件)を取得。未設定ならplaylistsから流用。"""
+        """クイックスロット(最大22件)を取得。未設定ならplaylistsから流用。"""
         slots = self.config.quick_slots or []
         if slots:
-            return slots[:5]
+            return slots[:22]
         # 後方互換: 旧playlists設定を使う
-        return (self.config.playlists or [])[:5]
+        return (self.config.playlists or [])[:22]
 
     def set_quick_slots(self, slots: List[str]):
-        """クイックスロット(1-5)を設定して保存"""
-        self.config.quick_slots = slots[:5]
+        """クイックスロット(最大22)を設定して保存"""
+        self.config.quick_slots = slots[:22]
         self.save_config()
