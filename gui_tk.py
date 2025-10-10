@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import List
-from itunes_controller import iTunesController
+from music_controller_base import create_music_controller
 from config import ConfigManager
 
 
@@ -91,7 +91,7 @@ class ITunesTkApp:
         # Prevent excessive shrinking that may clip content
         self.root.minsize(860, 600)
         self.config = config
-        self.ctrl = iTunesController()
+        self.ctrl = create_music_controller()
         self.quick_slots = self.config.get_quick_slots()
         self.last_action = "起動"
         self.tap_times: List[float] = []
