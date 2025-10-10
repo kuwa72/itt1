@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import List
+import os
 from music_controller_base import create_music_controller
 from config import ConfigManager
 
@@ -92,7 +93,24 @@ class ITunesTkApp:
         self.root.minsize(860, 600)
         self.config = config
         self.ctrl = create_music_controller()
-        self.quick_slots = self.config.get_quick_slots()
+        # First-run only: if config file does NOT exist, auto-assign quick slots from existing playlists (top-first)
+        cfg_exists = False
+        try:
+            cfg_exists = os.path.exists(self.config.config_file)
+        except Exception:
+            cfg_exists = True  # be safe: treat as exists to avoid unintended overwrite
+        if not cfg_exists:
+            try:
+                detected = self.ctrl.get_all_playlists() or []
+            except Exception:
+                detected = []
+            self.quick_slots = detected[:22]
+            try:
+                self.config.set_quick_slots(self.quick_slots)
+            except Exception:
+                pass
+        else:
+            self.quick_slots = self.config.get_quick_slots()
         self.last_action = "起動"
         self.tap_times: List[float] = []
         self.bpm_value: float | None = None

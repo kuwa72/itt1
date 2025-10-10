@@ -82,17 +82,27 @@ class WindowsMusicController:
     
     def skip_forward(self, seconds: int = 10):
         """指定秒数分スキップ"""
-        if self.itunes:
+        if not self.itunes:
+            return
+        try:
             current_pos = self.itunes.PlayerPosition
             new_pos = current_pos + seconds
             self.itunes.PlayerPosition = max(0, new_pos)
+        except Exception:
+            # Ignore COM errors (e.g., no current track, track deleted, transient state)
+            pass
     
     def skip_backward(self, seconds: int = 10):
         """指定秒数分戻る"""
-        if self.itunes:
+        if not self.itunes:
+            return
+        try:
             current_pos = self.itunes.PlayerPosition
             new_pos = current_pos - seconds
             self.itunes.PlayerPosition = max(0, new_pos)
+        except Exception:
+            # Ignore COM errors
+            pass
     
     def get_playlists(self) -> List[Dict[str, str]]:
         """利用可能なプレイリストを取得（簡易、名前とID相当のインデックス）"""

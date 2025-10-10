@@ -2,14 +2,18 @@ import json
 import os
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
+try:
+    # pydantic v2
+    from pydantic import ConfigDict  # type: ignore
+except Exception:  # pragma: no cover
+    ConfigDict = dict  # fallback for type hints
 
 
 class AppConfig(BaseModel):
-    """アプリケーション設定"""
-    playlists: List[str] = Field(
-        default=["お気に入り", "作業用", "リラックス", "運動用", "新曲"],
-        description="ワンキーで追加できるプレイリスト名"
-    )
+    """アプリケーション設定（playlists は廃止）"""
+    # 既存の config.json に playlists が残っていても無視する
+    model_config = ConfigDict(extra='ignore')  # type: ignore
+
     quick_slots: List[str] = Field(
         default_factory=list,
         description="クイックスロット(最大22: F1–F12, 0–9)に割り当てる既存プレイリスト名"
@@ -20,7 +24,7 @@ class AppConfig(BaseModel):
     )
     auto_create_playlists: bool = Field(
         default=True,
-        description="起動時にプレイリストを自動作成するか"
+        description="起動時にプレイリストを自動作成するか（現状未使用）"
     )
     refresh_interval: float = Field(
         default=0.25,
@@ -56,22 +60,10 @@ class ConfigManager:
         except Exception as e:
             print(f"設定ファイル保存エラー: {e}")
     
-    def update_playlists(self, playlists: List[str]):
-        """プレイリスト設定を更新"""
-        self.config.playlists = playlists
-        self.save_config()
-    
-    def get_playlists(self) -> List[str]:
-        """設定されたプレイリストを取得"""
-        return self.config.playlists
-
     def get_quick_slots(self) -> List[str]:
-        """クイックスロット(最大22件)を取得。未設定ならplaylistsから流用。"""
+        """クイックスロット(最大22件)を取得（playlists フォールバックは廃止）。"""
         slots = self.config.quick_slots or []
-        if slots:
-            return slots[:22]
-        # 後方互換: 旧playlists設定を使う
-        return (self.config.playlists or [])[:22]
+        return slots[:22]
 
     def set_quick_slots(self, slots: List[str]):
         """クイックスロット(最大22)を設定して保存"""
