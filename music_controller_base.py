@@ -78,23 +78,25 @@ class MacOSMusicController:
     def get_current_track_info(self) -> Dict[str, Any]:
         """Get current track info using JXA for better performance"""
         js = '''
-        const Music = Application('Music');
-        const props = { is_playing: false, name: '-', artist: '-', album: '-' };
-        if (!Music.running) return JSON.stringify(props);
+        (function() {
+            const Music = Application('Music');
+            const props = { is_playing: false, name: '-', artist: '-', album: '-' };
+            if (!Music.running()) return JSON.stringify(props);
 
-        const state = Music.playerState();
-        props.is_playing = state === 'playing';
+            const state = Music.playerState();
+            props.is_playing = state === 'playing';
 
-        if (state === 'playing' || state === 'paused') {
-            const track = Music.currentTrack();
-            props.name = track.name() || '-';
-            props.artist = track.artist() || '-';
-            props.album = track.album() || '-';
-            props.duration = track.duration() || 0;
-            props.position = Music.playerPosition();
-            props.database_id = track.databaseID();
-        }
-        return JSON.stringify(props);
+            if (state === 'playing' || state === 'paused') {
+                const track = Music.currentTrack();
+                props.name = track.name() || '-';
+                props.artist = track.artist() || '-';
+                props.album = track.album() || '-';
+                props.duration = track.duration() || 0;
+                props.position = Music.playerPosition();
+                props.database_id = track.databaseID();
+            }
+            return JSON.stringify(props);
+        })()
         '''
         return self._run_javascript(js)
 
@@ -132,10 +134,10 @@ class MacOSMusicController:
         end tell
         '''
         result = self._run_applescript(script)
-        # Parse AppleScript list format
+        # Parse AppleScript list format: "name:ライブラリ, name:ミュージック"
         import re
-        names = re.findall(r'name:\"([^\"]*)\"', result)
-        return [{'name': name} for name in names]
+        names = re.findall(r'name:([^,]+?)(?:,|$)', result)
+        return [{'name': name.strip()} for name in names]
 
     def get_all_playlists(self) -> List[str]:
         return [p['name'] for p in self.get_playlists()]
@@ -144,25 +146,29 @@ class MacOSMusicController:
         """Add current track to playlist"""
         script = f'''
         tell application "Music"
-            set target_playlist to user playlist "{playlist_name}"
-            set current_track to current track
+            try
+                set target_playlist to user playlist "{playlist_name}"
+                set current_track to current track
 
-            -- Check if already in playlist by database ID
-            set track_id to database ID of current_track
-            set exists to false
-            repeat with t in (get tracks of target_playlist)
-                if database ID of t = track_id then
-                    set exists to true
-                    exit repeat
+                -- Check if already in playlist by database ID
+                set track_id to database ID of current_track
+                set track_exists to false
+                repeat with t in (get tracks of target_playlist)
+                    if database ID of t = track_id then
+                        set track_exists to true
+                        exit repeat
+                    end if
+                end repeat
+
+                if not track_exists then
+                    duplicate current_track to target_playlist
+                    return "added"
+                else
+                    return "already_exists"
                 end if
-            end repeat
-
-            if not exists then
-                duplicate current_track to target_playlist
-                return "added"
-            else
-                return "already_exists"
-            end if
+            on error errMsg
+                return "error"
+            end try
         end tell
         '''
         try:

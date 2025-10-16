@@ -1,5 +1,5 @@
 # iTunes Controller
-Windows の iTunes を OLE で制御して、再生操作とプレイリスト構築を効率化する GUI アプリ。
+Windows の iTunes / macOS の Music アプリを制御して、再生操作とプレイリスト構築を効率化する GUI アプリ。
 
 ## 機能
 
@@ -12,9 +12,8 @@ Windows の iTunes を OLE で制御して、再生操作とプレイリスト�
 
 ## 必要な環境
 
-- Windows OS
-- Python 3.10 以上（型の `|` 演算子を使用）
-- iTunes（Windows版）
+- **Windows**: Python 3.10以上、iTunes（Windows版）
+- **macOS**: Python 3.10以上、Music アプリ、Tkinter
 
 ## インストール
 
@@ -24,9 +23,44 @@ git clone <repository-url>
 cd itt1
 ```
 
-2. 依存関係をインストール
+2. システム依存関係のインストール
+
+**macOS の場合:**
+
+Homebrewで直接Pythonを使用している場合:
+```bash
+# Tkinterのインストール（Python 3.13の場合）
+brew install python-tk@3.13
+
+# 他のバージョンの場合は @3.XX を適宜変更
+# 例: brew install python-tk@3.12
+```
+
+asdfでPythonを管理している場合:
+```bash
+# まずtcl-tkをインストール
+brew install tcl-tk
+
+# 既存のPythonをアンインストール
+asdf uninstall python <version>
+
+# Tkinterサポート付きで再インストール
+PYTHON_CONFIGURE_OPTS="--with-tcltk-includes='-I/opt/homebrew/opt/tcl-tk/include' --with-tcltk-libs='-L/opt/homebrew/opt/tcl-tk/lib -ltcl9.0 -ltk9.0'" asdf install python <version>
+
+# 例: Python 3.12.10の場合
+# PYTHON_CONFIGURE_OPTS="--with-tcltk-includes='-I/opt/homebrew/opt/tcl-tk/include' --with-tcltk-libs='-L/opt/homebrew/opt/tcl-tk/lib -ltcl9.0 -ltk9.0'" asdf install python 3.12.10
+```
+
+3. Python依存関係をインストール
+
+**共通の依存関係:**
 ```bash
 pip install -r requirements.txt
+```
+
+**Windows の場合、追加で:**
+```bash
+pip install -r requirements-windows.txt
 ```
 
 ## 使い方
