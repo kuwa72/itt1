@@ -422,17 +422,15 @@ class ITunesTkApp:
                 # 現在再生中の曲をハイライト
                 tags = ('playing',) if track.get('dbid') == current_dbid else ()
                 
+                # DBIDをタグとして保存
+                dbid_tag = f"dbid:{track.get('dbid')}"
+                item_tags = tags + (dbid_tag,)
+                
                 self.track_tree.insert('', 'end', 
                     text=track.get('name', ''),
                     values=(track.get('artist', ''), track.get('album', ''), time_str),
-                    tags=tags)
+                    tags=item_tags)
                 self.track_tree.tag_configure('playing', background='#e0f0ff')
-                
-                # DBIDを保存（再生用）
-                item_id = self.track_tree.get_children()[-1]
-                self.track_tree.set(item_id, '#0', track.get('name', ''))
-                # DBIDをタグとして保存
-                self.track_tree.item(item_id, tags=tags + (f"dbid:{track.get('dbid')}",))
         except Exception as e:
             print(f"トラック読み込みエラー: {e}")
     
