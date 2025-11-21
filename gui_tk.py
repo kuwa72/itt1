@@ -156,6 +156,10 @@ class ITunesTkApp:
         view_menu.add_checkbutton(label="BPMパネル", variable=self.show_bpm, command=self.toggle_bpm)
         view_menu.add_checkbutton(label="クイックスロット", variable=self.show_slots, command=self.toggle_slots)
         
+        nav_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="移動", menu=nav_menu)
+        nav_menu.add_command(label="再生中の曲へ移動 (Ctrl+G)", command=self.goto_current_track)
+        
         container = ttk.Frame(self.root)
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -194,6 +198,11 @@ class ITunesTkApp:
         # プレイリスト一覧
         self.playlist_frame = ttk.LabelFrame(self.middle_paned, text="プレイリスト")
         self.middle_paned.add(self.playlist_frame, weight=1)
+        
+        # プレイリストツールバー
+        playlist_toolbar = ttk.Frame(self.playlist_frame)
+        playlist_toolbar.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10).pack(side=tk.LEFT)
         
         playlist_scroll = ttk.Scrollbar(self.playlist_frame)
         playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -260,6 +269,7 @@ class ITunesTkApp:
             f"→: +{self.config.config.skip_seconds}秒 / ←: -{self.config.config.skip_seconds}秒\n"
             "↑: 前の曲 / ↓: 次の曲\n"
             "F1–F12, 0–9: クイックスロットに追加（テンキー対応）\n"
+            "Ctrl+G: 再生中の曲へ移動\n"
             "p: クイックスロット割当 / r: プレイリスト更新 / c: プレイリスト新規作成 / q: 終了"
         )
         ttk.Label(help_frame, text=help_text, justify=tk.LEFT).pack(anchor="w", padx=8, pady=6)
@@ -304,6 +314,8 @@ class ITunesTkApp:
             self.reset_bpm(); return "break"
         if k in ("q", "Q"):
             self.root.destroy(); return "break"
+        if k == "g" and (event.state & 0x4):  # Ctrl+G
+            self.goto_current_track(); return "break"
 
     # Actions
     def toggle_play_pause(self):
@@ -499,6 +511,59 @@ class ITunesTkApp:
             self.slots_frame.pack(fill=tk.X, pady=(10, 0))
         else:
             self.slots_frame.pack_forget()
+    
+    def goto_current_track(self):
+        """現在再生中のプレイリストとトラックに移動"""
+        try:
+            # 現在のプレイリストを取得
+            if not self.ctrl.itunes:
+                return
+            
+            current_playlist = getattr(self.ctrl.itunes, 'CurrentPlaylist', None)
+            if not current_playlist:
+                self.last_action = "再生中のプレイリストがありません"
+                return
+            
+            playlist_name = getattr(current_playlist, 'Name', '')
+            if not playlist_name:
+                self.last_action = "プレイリスト名を取得できません"
+                return
+            
+            # プレイリスト一覧から該当プレイリストを選択
+            for i in range(self.playlist_listbox.size()):
+                if self.playlist_listbox.get(i) == playlist_name:
+                    self.playlist_listbox.selection_clear(0, tk.END)
+                    self.playlist_listbox.selection_set(i)
+                    self.playlist_listbox.see(i)
+                    break
+            
+            # トラック一覧を読み込む
+            self.load_tracks(playlist_name)
+            
+            # 現在のトラックを選択
+            info = self.ctrl.get_current_track_info()
+            current_dbid = info.get('dbid') if info else None
+            
+            if current_dbid:
+                # トラック一覧から該当トラックを探して選択
+                for item in self.track_tree.get_children():
+                    tags = self.track_tree.item(item, 'tags')
+                    for tag in tags:
+                        if tag.startswith('dbid:'):
+                            try:
+                                dbid = int(tag.split(':')[1])
+                                if dbid == current_dbid:
+                                    self.track_tree.selection_set(item)
+                                    self.track_tree.see(item)
+                                    self.track_tree.focus(item)
+                                    self.last_action = f"再生中の曲へ移動: {playlist_name}"
+                                    return
+                            except:
+                                pass
+            
+            self.last_action = f"プレイリストへ移動: {playlist_name}"
+        except Exception as e:
+            print(f"再生中の曲へ移動エラー: {e}")
 
     def update_ui_loop(self):
         info = self.ctrl.get_current_track_info()
