@@ -395,6 +395,7 @@ class ITunesTkApp:
         """トラック一覧を読み込む"""
         try:
             tracks = self.ctrl.get_playlist_tracks(playlist_name)
+            print(f"トラック取得: {playlist_name} - {len(tracks)}曲")
             self.track_tree.delete(*self.track_tree.get_children())
             
             # 現在のトラックのDBIDを取得

@@ -47,7 +47,8 @@ class WindowsMusicController:
                 'album': current_track.Album,
                 'duration': current_track.Duration,
                 'position': self.itunes.PlayerPosition,
-                'is_playing': self.itunes.PlayerState == 1
+                'is_playing': self.itunes.PlayerState == 1,
+                'dbid': getattr(current_track, 'TrackDatabaseID', None)
             }
         except Exception as e:
             print(f"トラック情報取得エラー: {e}")
