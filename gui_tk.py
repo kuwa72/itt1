@@ -202,7 +202,8 @@ class ITunesTkApp:
         # プレイリストツールバー
         playlist_toolbar = ttk.Frame(self.playlist_frame)
         playlist_toolbar.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10).pack(side=tk.LEFT)
+        goto_btn = ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10, takefocus=False)
+        goto_btn.pack(side=tk.LEFT)
         
         playlist_scroll = ttk.Scrollbar(self.playlist_frame)
         playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -231,14 +232,20 @@ class ITunesTkApp:
         self.track_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         track_scroll.config(command=self.track_tree.yview)
         self.track_tree.bind("<Double-Button-1>", self.on_track_select)
+        # トラック一覧の上下キーを無効化（グローバルキーバインドと競合するため）
+        self.track_tree.bind("<Up>", lambda e: "break")
+        self.track_tree.bind("<Down>", lambda e: "break")
+        self.track_tree.bind("<Left>", lambda e: "break")
+        self.track_tree.bind("<Right>", lambda e: "break")
+        self.track_tree.bind("<space>", lambda e: "break")
 
         # BPM panel
         self.bpm_frame = ttk.LabelFrame(container, text="BPM (タップで計測)")
         self.bpm_frame.pack(fill=tk.X, pady=(6, 0))
         self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -")
         self.bpm_label.pack(side=tk.LEFT, padx=8, pady=6)
-        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm).pack(side=tk.LEFT, padx=4)
-        ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm, takefocus=False).pack(side=tk.LEFT, padx=4)
 
         # Quick slots
         self.slots_frame = ttk.LabelFrame(container, text="クイックスロット [F1–F12, 0–9]")
