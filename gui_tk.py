@@ -260,43 +260,10 @@ class ITunesTkApp:
     def add_to_slot(self, idx: int):
         if 0 <= idx < len(self.quick_slots):
             name = self.quick_slots[idx]
-            # Block while cache warming
-            if self._warming_cache:
-                try:
-                    messagebox.showinfo("情報", "キャッシュ構築中のため、追加は一時停止します。完了後に再試行してください。")
-                except Exception:
-                    pass
-                self.last_action = "追加保留: キャッシュ構築中"
-                return
-            # Ensure target playlist cache is fresh; if not, start warm-up and block
-            try:
-                fresh = self.ctrl.is_playlist_cache_fresh(name) if name and name != "(未設定)" else False
-            except Exception:
-                fresh = False
-            if not fresh:
-                self.start_warmup_caches()
-                try:
-                    messagebox.showinfo("情報", f"'{name}' のキャッシュを構築中です。完了後に再試行してください。")
-                except Exception:
-                    pass
-                self.last_action = f"追加保留: キャッシュ構築中 ({name})"
-                return
-            # Cache-based duplicate decision
-            try:
-                pls = self.ctrl.get_playlists_of_current_track_from_cache() or []
-            except Exception:
-                pls = []
-            if name in pls:
-                # Already present -> treat as success, no AddTrack
-                self.last_action = f"既に登録済み: {name}"
-                self._refresh_track_playlists_from_cache()
-                return
-            # Proceed to actual add
+            # Search APIベースなのでキャッシュ不要、即座に追加
             ok = self.ctrl.add_to_playlist(name)
             if ok:
                 self.last_action = f"追加: {name}"
-                # Addition succeeded; update label immediately from cache
-                self._refresh_track_playlists_from_cache()
             else:
                 self.last_action = f"追加失敗: {name}"
         else:
@@ -332,8 +299,6 @@ class ITunesTkApp:
     def refresh_playlists(self):
         # 画面上はスロットの存在状態を色分けなどしない。必要なら後で拡張
         self.ctrl.get_playlists()
-        # After clearing caches in controller, warm them up again
-        self.start_warmup_caches()
         self.last_action = "プレイリスト更新"
 
     def update_ui_loop(self):
