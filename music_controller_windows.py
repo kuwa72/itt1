@@ -158,11 +158,15 @@ class WindowsMusicController:
                         'artist': getattr(track, 'Artist', ''),
                         'album': getattr(track, 'Album', ''),
                         'duration': int(getattr(track, 'Duration', 0) or 0),
-                        'dbid': getattr(track, 'TrackDatabaseID', None)
+                        'dbid': getattr(track, 'TrackDatabaseID', None),
+                        'play_order': getattr(track, 'PlayOrderIndex', i)  # iTunes UIでの表示順
                     })
                 except Exception as e:
                     print(f"トラック{i}取得エラー: {e}")
                     continue
+            
+            # PlayOrderIndex順にソート（iTunes UIの表示順と一致）
+            tracks.sort(key=lambda x: x.get('play_order', 0))
         except Exception as e:
             print(f"トラック一覧取得エラー: {e}")
         
