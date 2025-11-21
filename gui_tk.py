@@ -212,6 +212,12 @@ class ITunesTkApp:
         self.playlist_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         playlist_scroll.config(command=self.playlist_listbox.yview)
         self.playlist_listbox.bind("<Double-Button-1>", self.on_playlist_select)
+        # プレイリスト一覧のキーを無効化（グローバルキーバインドと競合するため）
+        self.playlist_listbox.bind("<Up>", lambda e: "break")
+        self.playlist_listbox.bind("<Down>", lambda e: "break")
+        self.playlist_listbox.bind("<Left>", lambda e: "break")
+        self.playlist_listbox.bind("<Right>", lambda e: "break")
+        self.playlist_listbox.bind("<space>", lambda e: "break")
         
         # トラック一覧
         self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
