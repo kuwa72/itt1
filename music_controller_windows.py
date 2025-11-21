@@ -149,7 +149,7 @@ class WindowsMusicController:
             
             print(f"プレイリスト '{playlist_name}' のトラック数: {count}")
             
-            for i in range(1, min(count + 1, 1001)):  # 最大1000曲まで
+            for i in range(1, count + 1):
                 try:
                     track = tracks_collection.Item(i)
                     tracks.append({
