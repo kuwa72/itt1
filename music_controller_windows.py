@@ -92,6 +92,15 @@ class WindowsMusicController:
             # Ignore COM errors
             pass
     
+    def set_player_position(self, position: float):
+        """再生位置を設定（秒単位）"""
+        if not self.itunes:
+            return
+        try:
+            self.itunes.PlayerPosition = max(0, position)
+        except Exception:
+            pass
+    
     def get_playlists(self) -> List[Dict[str, str]]:
         """利用可能なプレイリストを取得（簡易、名前とID相当のインデックス）"""
         if not self.itunes:
@@ -115,6 +124,98 @@ class WindowsMusicController:
             print(f"プレイリスト取得エラー: {e}")
         
         return playlists
+    
+    def get_playlist_tracks(self, playlist_name: str) -> List[Dict[str, Any]]:
+        """指定プレイリストのトラック一覧を取得"""
+        if not self.itunes:
+            return []
+        
+        tracks = []
+        try:
+            target = self._find_playlist_by_name(playlist_name)
+            if target is None:
+                return []
+            
+            tracks_collection = getattr(target, 'Tracks', None)
+            if tracks_collection is None:
+                return []
+            
+            try:
+                count = tracks_collection.Count
+            except Exception:
+                count = 0
+            
+            for i in range(1, min(count + 1, 1001)):  # 最大1000曲まで
+                try:
+                    track = tracks_collection.Item(i)
+                    tracks.append({
+                        'index': i,
+                        'name': getattr(track, 'Name', ''),
+                        'artist': getattr(track, 'Artist', ''),
+                        'album': getattr(track, 'Album', ''),
+                        'duration': int(getattr(track, 'Duration', 0) or 0),
+                        'dbid': getattr(track, 'TrackDatabaseID', None)
+                    })
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"トラック一覧取得エラー: {e}")
+        
+        return tracks
+    
+    def get_current_playlist_tracks(self) -> List[Dict[str, Any]]:
+        """現在再生中のプレイリストのトラック一覧を取得"""
+        if not self.itunes:
+            return []
+        
+        try:
+            current_playlist = getattr(self.itunes, 'CurrentPlaylist', None)
+            if current_playlist is None:
+                return []
+            
+            playlist_name = getattr(current_playlist, 'Name', '')
+            if not playlist_name:
+                return []
+            
+            return self.get_playlist_tracks(playlist_name)
+        except Exception as e:
+            print(f"現在のプレイリスト取得エラー: {e}")
+            return []
+    
+    def play_track_by_dbid(self, dbid: int) -> bool:
+        """TrackDatabaseIDで指定したトラックを再生"""
+        if not self.itunes or not isinstance(dbid, int):
+            return False
+        
+        try:
+            # LibraryPlaylistから検索
+            lib_playlist = getattr(self.itunes, 'LibraryPlaylist', None)
+            if lib_playlist is None:
+                return False
+            
+            tracks = getattr(lib_playlist, 'Tracks', None)
+            if tracks is None:
+                return False
+            
+            # DBIDで検索
+            try:
+                count = tracks.Count
+            except Exception:
+                return False
+            
+            for i in range(1, count + 1):
+                try:
+                    track = tracks.Item(i)
+                    if getattr(track, 'TrackDatabaseID', None) == dbid:
+                        track.Play()
+                        return True
+                except Exception:
+                    continue
+            
+            return False
+        except Exception as e:
+            print(f"トラック再生エラー: {e}")
+            return False
     
     def add_to_playlist(self, playlist_name: str) -> bool:
         """現在のトラックを指定されたプレイリストに追加。

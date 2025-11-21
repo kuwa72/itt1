@@ -123,6 +123,16 @@ class ITunesTkApp:
         self._fetching_track_playlists: bool = False
         self._loading_indicator_after_id: int | None = None
         self._warming_cache: bool = False
+        
+        # 表示状態
+        self.show_progress = tk.BooleanVar(value=True)
+        self.show_playlists = tk.BooleanVar(value=True)
+        self.show_tracks = tk.BooleanVar(value=True)
+        self.show_bpm = tk.BooleanVar(value=True)
+        self.show_slots = tk.BooleanVar(value=True)
+        
+        # プログレスバーのドラッグ中フラグ
+        self._seeking = False
 
         # UI
         self.build_ui()
@@ -133,10 +143,19 @@ class ITunesTkApp:
         # Start update loop
         self.update_ui_loop()
 
-        # Warm up caches for quick slot playlists at startup
-        self.start_warmup_caches()
-
     def build_ui(self):
+        # メニューバー
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="表示", menu=view_menu)
+        view_menu.add_checkbutton(label="プログレスバー", variable=self.show_progress, command=self.toggle_progress)
+        view_menu.add_checkbutton(label="プレイリスト一覧", variable=self.show_playlists, command=self.toggle_playlists)
+        view_menu.add_checkbutton(label="トラック一覧", variable=self.show_tracks, command=self.toggle_tracks)
+        view_menu.add_checkbutton(label="BPMパネル", variable=self.show_bpm, command=self.toggle_bpm)
+        view_menu.add_checkbutton(label="クイックスロット", variable=self.show_slots, command=self.toggle_slots)
+        
         container = ttk.Frame(self.root)
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -151,6 +170,15 @@ class ITunesTkApp:
         self.track_artist.pack(anchor="w", padx=8)
         self.track_album = ttk.Label(track_frame, text="アルバム: -")
         self.track_album.pack(anchor="w", padx=8, pady=(0, 6))
+        
+        # プログレスバー
+        self.progress_frame = ttk.Frame(track_frame)
+        self.progress_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.progress_bar = ttk.Scale(self.progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_progress_change)
+        self.progress_bar.pack(fill=tk.X)
+        self.progress_bar.bind("<ButtonPress-1>", lambda e: setattr(self, '_seeking', True))
+        self.progress_bar.bind("<ButtonRelease-1>", lambda e: setattr(self, '_seeking', False))
+        
         self.track_time = ttk.Label(track_frame, text="時間: 00:00 / 00:00")
         self.track_time.pack(anchor="w", padx=8, pady=(0, 8))
         # Playlists containing current track
@@ -158,20 +186,56 @@ class ITunesTkApp:
         self.track_in_playlists.pack(anchor="w", padx=8, pady=(0, 8))
         self.last_action_label = ttk.Label(track_frame, text="最終アクション: 起動", foreground="#008b8b")
         self.last_action_label.pack(anchor="w", padx=8, pady=(0, 8))
+        
+        # 中央パネル（プレイリストとトラック）
+        self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
+        self.middle_paned.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        
+        # プレイリスト一覧
+        self.playlist_frame = ttk.LabelFrame(self.middle_paned, text="プレイリスト")
+        self.middle_paned.add(self.playlist_frame, weight=1)
+        
+        playlist_scroll = ttk.Scrollbar(self.playlist_frame)
+        playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.playlist_listbox = tk.Listbox(self.playlist_frame, yscrollcommand=playlist_scroll.set)
+        self.playlist_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        playlist_scroll.config(command=self.playlist_listbox.yview)
+        self.playlist_listbox.bind("<Double-Button-1>", self.on_playlist_select)
+        
+        # トラック一覧
+        self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
+        self.middle_paned.add(self.track_frame_list, weight=2)
+        
+        track_scroll = ttk.Scrollbar(self.track_frame_list)
+        track_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.track_tree = ttk.Treeview(self.track_frame_list, columns=("artist", "album", "time"), show="tree headings", yscrollcommand=track_scroll.set)
+        self.track_tree.heading("#0", text="曲名")
+        self.track_tree.heading("artist", text="アーティスト")
+        self.track_tree.heading("album", text="アルバム")
+        self.track_tree.heading("time", text="時間")
+        self.track_tree.column("#0", width=200)
+        self.track_tree.column("artist", width=150)
+        self.track_tree.column("album", width=150)
+        self.track_tree.column("time", width=60)
+        self.track_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        track_scroll.config(command=self.track_tree.yview)
+        self.track_tree.bind("<Double-Button-1>", self.on_track_select)
 
         # BPM panel
-        bpm_frame = ttk.LabelFrame(container, text="BPM (タップで計測)")
-        bpm_frame.pack(fill=tk.X, pady=(6, 0))
-        self.bpm_label = ttk.Label(bpm_frame, text="BPM: -")
+        self.bpm_frame = ttk.LabelFrame(container, text="BPM (タップで計測)")
+        self.bpm_frame.pack(fill=tk.X, pady=(6, 0))
+        self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -")
         self.bpm_label.pack(side=tk.LEFT, padx=8, pady=6)
-        ttk.Button(bpm_frame, text="Tap (t)", command=self.tap_bpm).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bpm_frame, text="Reset (x)", command=self.reset_bpm).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm).pack(side=tk.LEFT, padx=4)
 
         # Quick slots
-        slots_frame = ttk.LabelFrame(container, text="クイックスロット [F1–F12, 0–9]")
-        slots_frame.pack(fill=tk.X, pady=(10, 0))
+        self.slots_frame = ttk.LabelFrame(container, text="クイックスロット [F1–F12, 0–9]")
+        self.slots_frame.pack(fill=tk.X, pady=(10, 0))
         self.slot_labels: List[ttk.Label] = []
-        grid = ttk.Frame(slots_frame)
+        grid = ttk.Frame(self.slots_frame)
         grid.pack(fill=tk.X, padx=8, pady=6)
         # 4 columns grid for 22 slots (rows up to 6)
         columns = 4
@@ -184,6 +248,9 @@ class ITunesTkApp:
             r, c = divmod(i, columns)
             lbl.grid(row=r, column=c, sticky="w", padx=10, pady=4)
             self.slot_labels.append(lbl)
+        
+        # プレイリストを読み込む
+        self.load_playlists()
 
         # Help
         help_frame = ttk.LabelFrame(container, text="操作")
@@ -299,7 +366,138 @@ class ITunesTkApp:
     def refresh_playlists(self):
         # 画面上はスロットの存在状態を色分けなどしない。必要なら後で拡張
         self.ctrl.get_playlists()
+        self.load_playlists()
         self.last_action = "プレイリスト更新"
+    
+    def load_playlists(self):
+        """プレイリスト一覧を読み込む"""
+        try:
+            playlists = self.ctrl.get_playlists()
+            self.playlist_listbox.delete(0, tk.END)
+            for pl in playlists:
+                self.playlist_listbox.insert(tk.END, pl['name'])
+        except Exception as e:
+            print(f"プレイリスト読み込みエラー: {e}")
+    
+    def on_playlist_select(self, event):
+        """プレイリスト選択時"""
+        try:
+            selection = self.playlist_listbox.curselection()
+            if not selection:
+                return
+            playlist_name = self.playlist_listbox.get(selection[0])
+            self.load_tracks(playlist_name)
+            self.last_action = f"プレイリスト選択: {playlist_name}"
+        except Exception as e:
+            print(f"プレイリスト選択エラー: {e}")
+    
+    def load_tracks(self, playlist_name: str):
+        """トラック一覧を読み込む"""
+        try:
+            tracks = self.ctrl.get_playlist_tracks(playlist_name)
+            self.track_tree.delete(*self.track_tree.get_children())
+            
+            # 現在のトラックのDBIDを取得
+            info = self.ctrl.get_current_track_info()
+            current_dbid = info.get('dbid') if info else None
+            
+            for track in tracks:
+                duration = track.get('duration', 0)
+                m, s = divmod(duration, 60)
+                time_str = f"{m:02d}:{s:02d}"
+                
+                # 現在再生中の曲をハイライト
+                tags = ('playing',) if track.get('dbid') == current_dbid else ()
+                
+                self.track_tree.insert('', 'end', 
+                    text=track.get('name', ''),
+                    values=(track.get('artist', ''), track.get('album', ''), time_str),
+                    tags=tags)
+                self.track_tree.tag_configure('playing', background='#e0f0ff')
+                
+                # DBIDを保存（再生用）
+                item_id = self.track_tree.get_children()[-1]
+                self.track_tree.set(item_id, '#0', track.get('name', ''))
+                # DBIDをタグとして保存
+                self.track_tree.item(item_id, tags=tags + (f"dbid:{track.get('dbid')}",))
+        except Exception as e:
+            print(f"トラック読み込みエラー: {e}")
+    
+    def on_track_select(self, event):
+        """トラック選択時（ダブルクリック）"""
+        try:
+            selection = self.track_tree.selection()
+            if not selection:
+                return
+            item = selection[0]
+            tags = self.track_tree.item(item, 'tags')
+            
+            # DBIDを取得
+            dbid = None
+            for tag in tags:
+                if tag.startswith('dbid:'):
+                    try:
+                        dbid = int(tag.split(':')[1])
+                        break
+                    except:
+                        pass
+            
+            if dbid:
+                ok = self.ctrl.play_track_by_dbid(dbid)
+                if ok:
+                    self.last_action = f"トラック再生: {self.track_tree.item(item, 'text')}"
+                else:
+                    self.last_action = "トラック再生失敗"
+        except Exception as e:
+            print(f"トラック選択エラー: {e}")
+    
+    def on_progress_change(self, value):
+        """プログレスバー変更時"""
+        if self._seeking:
+            try:
+                info = self.ctrl.get_current_track_info()
+                if info:
+                    duration = info.get('duration', 0)
+                    if duration > 0:
+                        position = float(value) * duration / 100
+                        self.ctrl.set_player_position(position)
+            except Exception:
+                pass
+    
+    # トグルメソッド
+    def toggle_progress(self):
+        if self.show_progress.get():
+            self.progress_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+        else:
+            self.progress_frame.pack_forget()
+    
+    def toggle_playlists(self):
+        if self.show_playlists.get():
+            if self.playlist_frame not in self.middle_paned.panes():
+                self.middle_paned.add(self.playlist_frame, weight=1)
+        else:
+            if self.playlist_frame in self.middle_paned.panes():
+                self.middle_paned.remove(self.playlist_frame)
+    
+    def toggle_tracks(self):
+        if self.show_tracks.get():
+            if self.track_frame_list not in self.middle_paned.panes():
+                self.middle_paned.add(self.track_frame_list, weight=2)
+        else:
+            if self.track_frame_list in self.middle_paned.panes():
+                self.middle_paned.remove(self.track_frame_list)
+    
+    def toggle_bpm(self):
+        if self.show_bpm.get():
+            self.bpm_frame.pack(fill=tk.X, pady=(6, 0))
+        else:
+            self.bpm_frame.pack_forget()
+    
+    def toggle_slots(self):
+        if self.show_slots.get():
+            self.slots_frame.pack(fill=tk.X, pady=(10, 0))
+        else:
+            self.slots_frame.pack_forget()
 
     def update_ui_loop(self):
         info = self.ctrl.get_current_track_info()
@@ -314,35 +512,11 @@ class ITunesTkApp:
             pm, ps = divmod(pos, 60)
             dm, ds = divmod(dur, 60)
             self.track_time.configure(text=f"時間: {pm:02d}:{ps:02d} / {dm:02d}:{ds:02d}")
-            # Update playlists containing current track when track signature changes (cache-only)
-            sig = (info.get('name'), info.get('artist'), info.get('album'), int(info.get('duration', 0) or 0))
-            if sig != self._last_track_sig:
-                self._last_track_sig = sig
-                # Query only from controller's caches (fast, non-blocking)
-                try:
-                    pls = self.ctrl.get_playlists_of_current_track_from_cache() or []
-                except Exception:
-                    pls = []
-                # If any quick slot playlist cache is stale/absent, start warm-up and indicate it
-                try:
-                    stale_found = False
-                    for name in self.quick_slots:
-                        if not name or name == "(未設定)":
-                            continue
-                        if not self.ctrl.is_playlist_cache_fresh(name):
-                            stale_found = True
-                            break
-                    if stale_found:
-                        self.start_warmup_caches()
-                except Exception:
-                    pass
-                self._last_playlists_of_track = pls
-                # If cache warm-up is running, indicate it; otherwise show current cached result
-                if self._warming_cache:
-                    self.track_in_playlists.configure(text="この曲の登録先: キャッシュ構築中…")
-                else:
-                    txt = ", ".join(pls) if pls else "-"
-                    self.track_in_playlists.configure(text=f"この曲の登録先: {txt}")
+            
+            # プログレスバー更新（ドラッグ中は更新しない）
+            if not self._seeking and dur > 0:
+                progress = (pos / dur) * 100
+                self.progress_bar.set(progress)
         # BPM表示更新
         if self.bpm_value:
             self.bpm_label.configure(text=f"BPM: {self.bpm_value:.1f}")
@@ -350,70 +524,6 @@ class ITunesTkApp:
             self.bpm_label.configure(text="BPM: -")
         self.last_action_label.configure(text=f"最終アクション: {self.last_action}")
         self.root.after(int(self.config.config.refresh_interval * 1000), self.update_ui_loop)
-
-    def _refresh_track_playlists_from_cache(self):
-        """Update 'この曲の登録先' label from controller caches immediately."""
-        try:
-            pls = self.ctrl.get_playlists_of_current_track_from_cache() or []
-        except Exception:
-            pls = []
-        self._last_playlists_of_track = pls
-        # If warming cache, still show constructing state; otherwise show updated list
-        if self._warming_cache:
-            try:
-                self.track_in_playlists.configure(text="この曲の登録先: キャッシュ構築中…")
-            except Exception:
-                pass
-        else:
-            txt = ", ".join(pls) if pls else "-"
-            try:
-                self.track_in_playlists.configure(text=f"この曲の登録先: {txt}")
-            except Exception:
-                pass
-
-    def start_warmup_caches(self):
-        if self._warming_cache:
-            return
-        self._warming_cache = True
-        # Show warming indicator immediately
-        try:
-            self.track_in_playlists.configure(text="この曲の登録先: キャッシュ構築中…")
-        except Exception:
-            pass
-        import threading
-        current_sig = self._last_track_sig
-        slots = list(self.quick_slots)
-        def _worker():
-            try:
-                # Build DBID caches for quick slot playlists
-                for name in slots:
-                    if not name or name == "(未設定)":
-                        continue
-                    try:
-                        # Build full cache for this playlist
-                        self.ctrl.get_playlist_dbids_threadsafe(name)
-                    except Exception:
-                        continue
-            finally:
-                def _apply_after():
-                    self._warming_cache = False
-                    # After warm-up, update current track's membership from cache and show it
-                    try:
-                        pls = self.ctrl.get_playlists_of_current_track_from_cache() or []
-                    except Exception:
-                        pls = []
-                    # Only apply if the track hasn't changed drastically; otherwise still fine to display latest
-                    self._last_playlists_of_track = pls
-                    txt = ", ".join(pls) if pls else "-"
-                    try:
-                        self.track_in_playlists.configure(text=f"この曲の登録先: {txt}")
-                    except Exception:
-                        pass
-                try:
-                    self.root.after(0, _apply_after)
-                except Exception:
-                    self._warming_cache = False
-        threading.Thread(target=_worker, daemon=True).start()
 
     # BPM helpers
     def tap_bpm(self):
