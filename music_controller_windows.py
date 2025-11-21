@@ -143,8 +143,11 @@ class WindowsMusicController:
             
             try:
                 count = tracks_collection.Count
-            except Exception:
+            except Exception as e:
+                print(f"トラック数取得エラー: {e}")
                 count = 0
+            
+            print(f"プレイリスト '{playlist_name}' のトラック数: {count}")
             
             for i in range(1, min(count + 1, 1001)):  # 最大1000曲まで
                 try:
@@ -157,7 +160,8 @@ class WindowsMusicController:
                         'duration': int(getattr(track, 'Duration', 0) or 0),
                         'dbid': getattr(track, 'TrackDatabaseID', None)
                     })
-                except Exception:
+                except Exception as e:
+                    print(f"トラック{i}取得エラー: {e}")
                     continue
         except Exception as e:
             print(f"トラック一覧取得エラー: {e}")
