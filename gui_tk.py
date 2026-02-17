@@ -2,6 +2,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import List
 import os
+import plistlib
+import threading
+import queue
 from music_controller_base import create_music_controller
 from config import ConfigManager
 
@@ -15,7 +18,7 @@ class PlaylistPicker(tk.Toplevel):
         self.result = None
         self.max_select = max_select
 
-        label = ttk.Label(self, text=f"クイックスロットに割り当てるプレイリストを選択してください (最大{self.max_select}件)\nショートカット: F1–F12, 0–9")
+        label = ttk.Label(self, text=f"クイックスロットに割り当てるプレイリストを選択してください (最大{self.max_select}件)")
         label.pack(padx=10, pady=(10, 6), anchor="w")
 
         # List container with vertical scrollbar
@@ -104,19 +107,36 @@ class ITunesTkApp:
                 detected = self.ctrl.get_all_playlists() or []
             except Exception:
                 detected = []
-            self.quick_slots = detected[:22]
+            self.quick_slots = list(detected)
             try:
                 self.config.set_quick_slots(self.quick_slots)
             except Exception:
                 pass
         else:
             self.quick_slots = self.config.get_quick_slots()
-        self.last_action = "起動"
+        xml_path, xml_exists = ("", False)
+        try:
+            xml_path, xml_exists = self.config.check_library_xml_exists()
+        except Exception:
+            xml_path, xml_exists = ("", False)
+        if xml_path and xml_exists:
+            self.last_action = f"XML検出: {xml_path}"
+        elif xml_path and not xml_exists:
+            self.last_action = f"XML未検出: {xml_path}"
+        else:
+            self.last_action = "XML未設定"
+        self._library_xml_path = xml_path
+        self._library_xml_exists = bool(xml_path and xml_exists)
+        self._library_xml_mtime: float | None = None
+        self._library_xml_tracks: dict[str, dict] | None = None
+        self._library_xml_playlists: list[dict] | None = None
+        self._library_xml_lock = threading.Lock()
         self.tap_times: List[float] = []
         self.bpm_value: float | None = None
-        # Key mapping for slots: F1..F12 (1..12), then digits 1..9,0 (13..22)
-        self.slot_keys: List[str] = [*(f"F{i}" for i in range(1,13)), "1","2","3","4","5","6","7","8","9","0"]
-        self.slot_count = len(self.slot_keys)  # 22
+        # ASCII keyboard top 3 rows: number row + QWERTY + ASDF (per-page)
+        self.slot_keys: List[str] = list("1234567890-=") + list("qwertyuiop[]\\") + list("asdfghjkl;'")
+        self.bank_size = len(self.slot_keys)
+        self.slot_bank = 0
         # For current track playlist display
         self._last_track_sig: tuple | None = None
         self._last_playlists_of_track: List[str] = []
@@ -133,6 +153,17 @@ class ITunesTkApp:
         
         # プログレスバーのドラッグ中フラグ
         self._seeking = False
+        
+        # トラック読み込みワーカー管理（COMはコントローラー側で扱う）
+        self._track_loading_thread: threading.Thread | None = None
+        self._track_loading_cancel_event: threading.Event | None = None
+        self._track_loading_queue: "queue.Queue[list[dict]] | None" = None
+        self._track_loading_playlist: str | None = None
+        self._track_loading_dbid: int | None = None
+
+        # 曲変更検知用
+        self._synced_dbid: int | None = None
+        self._synced_playlist: str | None = None
 
         # UI
         self.build_ui()
@@ -142,6 +173,9 @@ class ITunesTkApp:
 
         # Start update loop
         self.update_ui_loop()
+
+        # 起動直後にiTunesの再生状態をUIに反映
+        self.root.after(300, self._sync_to_itunes_state)
 
     def build_ui(self):
         # メニューバー
@@ -166,30 +200,55 @@ class ITunesTkApp:
         # Track panel
         track_frame = ttk.LabelFrame(container, text="現在のトラック")
         track_frame.pack(fill=tk.X)
-        self.track_status = ttk.Label(track_frame, text="⏸ 一時停止")
-        self.track_status.pack(anchor="w", padx=8, pady=(6, 2))
-        self.track_title = ttk.Label(track_frame, text="曲名: -", font=("", 10, "bold"))
-        self.track_title.pack(anchor="w", padx=8)
-        self.track_artist = ttk.Label(track_frame, text="アーティスト: -")
-        self.track_artist.pack(anchor="w", padx=8)
-        self.track_album = ttk.Label(track_frame, text="アルバム: -")
-        self.track_album.pack(anchor="w", padx=8, pady=(0, 6))
+        track_frame.columnconfigure(0, weight=1)
+        track_frame.columnconfigure(1, weight=0)
+
+        top_row = ttk.Frame(track_frame)
+        top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        top_row.columnconfigure(0, weight=0)
+        top_row.columnconfigure(1, weight=1)
+
+        self.track_status = ttk.Label(top_row, text="⏸ 一時停止")
+        self.track_status.grid(row=0, column=0, sticky="w")
+        self.track_title = ttk.Label(top_row, text="曲名: -", font=("", 10, "bold"))
+        self.track_title.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        # BPM panel (inside track panel)
+        self.bpm_frame = ttk.Frame(track_frame)
+        self.bpm_frame.grid(row=0, column=1, sticky="e", padx=8, pady=(6, 2))
+        self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -")
+        self.bpm_label.pack(side=tk.LEFT)
+        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
+
+        meta_row = ttk.Frame(track_frame)
+        meta_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8)
+        meta_row.columnconfigure(0, weight=1)
+        meta_row.columnconfigure(1, weight=1)
+        meta_row.columnconfigure(2, weight=0)
+        self.track_artist = ttk.Label(meta_row, text="アーティスト: -")
+        self.track_artist.grid(row=0, column=0, sticky="w")
+        self.track_album = ttk.Label(meta_row, text="アルバム: -")
+        self.track_album.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.track_time = ttk.Label(meta_row, text="時間: 00:00 / 00:00")
+        self.track_time.grid(row=0, column=2, sticky="e")
         
         # プログレスバー
         self.progress_frame = ttk.Frame(track_frame)
-        self.progress_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.progress_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 4))
         self.progress_bar = ttk.Scale(self.progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_progress_change)
         self.progress_bar.pack(fill=tk.X)
         self.progress_bar.bind("<ButtonPress-1>", lambda e: setattr(self, '_seeking', True))
         self.progress_bar.bind("<ButtonRelease-1>", lambda e: setattr(self, '_seeking', False))
-        
-        self.track_time = ttk.Label(track_frame, text="時間: 00:00 / 00:00")
-        self.track_time.pack(anchor="w", padx=8, pady=(0, 8))
-        # Playlists containing current track
-        self.track_in_playlists = ttk.Label(track_frame, text="この曲の登録先: -", foreground="#666")
-        self.track_in_playlists.pack(anchor="w", padx=8, pady=(0, 8))
-        self.last_action_label = ttk.Label(track_frame, text="最終アクション: 起動", foreground="#008b8b")
-        self.last_action_label.pack(anchor="w", padx=8, pady=(0, 8))
+
+        bottom_row = ttk.Frame(track_frame)
+        bottom_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+        bottom_row.columnconfigure(0, weight=1)
+        bottom_row.columnconfigure(1, weight=1)
+        self.track_in_playlists = ttk.Label(bottom_row, text="この曲の登録先: -", foreground="#666")
+        self.track_in_playlists.grid(row=0, column=0, sticky="w")
+        self.last_action_label = ttk.Label(bottom_row, text="最終アクション: 起動", foreground="#008b8b")
+        self.last_action_label.grid(row=0, column=1, sticky="e")
         
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
@@ -213,11 +272,11 @@ class ITunesTkApp:
         playlist_scroll.config(command=self.playlist_listbox.yview)
         self.playlist_listbox.bind("<Double-Button-1>", self.on_playlist_select)
         # プレイリスト一覧のキーを無効化（グローバルキーバインドと競合するため）
-        self.playlist_listbox.bind("<Up>", lambda e: "break")
-        self.playlist_listbox.bind("<Down>", lambda e: "break")
-        self.playlist_listbox.bind("<Left>", lambda e: "break")
-        self.playlist_listbox.bind("<Right>", lambda e: "break")
-        self.playlist_listbox.bind("<space>", lambda e: "break")
+        self.playlist_listbox.bind("<Up>", self.on_key)
+        self.playlist_listbox.bind("<Down>", self.on_key)
+        self.playlist_listbox.bind("<Left>", self.on_key)
+        self.playlist_listbox.bind("<Right>", self.on_key)
+        self.playlist_listbox.bind("<space>", self.on_key)
         
         # トラック一覧
         self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
@@ -226,85 +285,135 @@ class ITunesTkApp:
         track_scroll = ttk.Scrollbar(self.track_frame_list)
         track_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.track_tree = ttk.Treeview(self.track_frame_list, columns=("artist", "album", "time"), show="tree headings", yscrollcommand=track_scroll.set)
+        self.track_tree = ttk.Treeview(
+            self.track_frame_list,
+            columns=("artist", "album", "time", "date_added", "purchase_date"),
+            show="tree headings",
+            yscrollcommand=track_scroll.set,
+        )
         self.track_tree.heading("#0", text="曲名")
         self.track_tree.heading("artist", text="アーティスト")
         self.track_tree.heading("album", text="アルバム")
         self.track_tree.heading("time", text="時間")
+        self.track_tree.heading("date_added", text="追加日")
+        self.track_tree.heading("purchase_date", text="購入日")
         self.track_tree.column("#0", width=200)
         self.track_tree.column("artist", width=150)
         self.track_tree.column("album", width=150)
         self.track_tree.column("time", width=60)
+        self.track_tree.column("date_added", width=120)
+        self.track_tree.column("purchase_date", width=120)
         self.track_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         track_scroll.config(command=self.track_tree.yview)
         self.track_tree.bind("<Double-Button-1>", self.on_track_select)
         # トラック一覧の上下キーを無効化（グローバルキーバインドと競合するため）
-        self.track_tree.bind("<Up>", lambda e: "break")
-        self.track_tree.bind("<Down>", lambda e: "break")
-        self.track_tree.bind("<Left>", lambda e: "break")
-        self.track_tree.bind("<Right>", lambda e: "break")
-        self.track_tree.bind("<space>", lambda e: "break")
+        self.track_tree.bind("<Up>", self.on_key)
+        self.track_tree.bind("<Down>", self.on_key)
+        self.track_tree.bind("<Left>", self.on_key)
+        self.track_tree.bind("<Right>", self.on_key)
+        self.track_tree.bind("<space>", self.on_key)
 
-        # BPM panel
-        self.bpm_frame = ttk.LabelFrame(container, text="BPM (タップで計測)")
-        self.bpm_frame.pack(fill=tk.X, pady=(6, 0))
-        self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -")
-        self.bpm_label.pack(side=tk.LEFT, padx=8, pady=6)
-        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=4)
-        ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm, takefocus=False).pack(side=tk.LEFT, padx=4)
+        self._track_tree_sort_reverse: dict[str, bool] = {}
+        self._track_tree_item_meta: dict[str, dict] = {}
+
+        self.track_tree.heading("#0", command=lambda: self.sort_track_tree("name"))
+        self.track_tree.heading("artist", command=lambda: self.sort_track_tree("artist"))
+        self.track_tree.heading("album", command=lambda: self.sort_track_tree("album"))
+        self.track_tree.heading("time", command=lambda: self.sort_track_tree("time"))
+        self.track_tree.heading("date_added", command=lambda: self.sort_track_tree("date_added"))
+        self.track_tree.heading("purchase_date", command=lambda: self.sort_track_tree("purchase_date"))
 
         # Quick slots
-        self.slots_frame = ttk.LabelFrame(container, text="クイックスロット [F1–F12, 0–9]")
-        self.slots_frame.pack(fill=tk.X, pady=(10, 0))
+        self.slots_frame = ttk.LabelFrame(container, text="クイックスロット")
+        self.slots_frame.pack(fill=tk.X, pady=(6, 0))
+        header = ttk.Frame(self.slots_frame)
+        header.pack(fill=tk.X, padx=6, pady=(4, 0))
+        self.slots_page_label = ttk.Label(header, text="バンク: 1")
+        self.slots_page_label.pack(side=tk.LEFT)
+        self.slots_hint_label = ttk.Label(header, text="上3段キーで追加  Ctrlでバンク2  ,/.でバンク固定切替", foreground="#666")
+        self.slots_hint_label.pack(side=tk.RIGHT)
         self.slot_labels: List[ttk.Label] = []
         grid = ttk.Frame(self.slots_frame)
-        grid.pack(fill=tk.X, padx=8, pady=6)
-        # 4 columns grid for 22 slots (rows up to 6)
-        columns = 4
+        grid.pack(fill=tk.X, padx=6, pady=(2, 4))
+        columns = 9
         for c in range(columns):
             grid.columnconfigure(c, weight=1)
-        for i in range(self.slot_count):
-            name = self.quick_slots[i] if i < len(self.quick_slots) else "(未設定)"
-            key_label = self.slot_keys[i]
-            lbl = ttk.Label(grid, text=f"{key_label}: {name}")
+        for i in range(self.bank_size):
+            lbl = ttk.Label(grid, text="")
             r, c = divmod(i, columns)
-            lbl.grid(row=r, column=c, sticky="w", padx=10, pady=4)
+            lbl.grid(row=r, column=c, sticky="w", padx=4, pady=1)
             self.slot_labels.append(lbl)
+        self.update_slot_labels()
         
         # プレイリストを読み込む
         self.load_playlists()
 
         # Help
         help_frame = ttk.LabelFrame(container, text="操作")
-        help_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
         help_text = (
-            "スペース: 再生/一時停止\n"
-            f"→: +{self.config.config.skip_seconds}秒 / ←: -{self.config.config.skip_seconds}秒\n"
-            "↑: 前の曲 / ↓: 次の曲\n"
-            "F1–F12, 0–9: クイックスロットに追加（テンキー対応）\n"
-            "Ctrl+G: 再生中の曲へ移動\n"
-            "p: クイックスロット割当 / r: プレイリスト更新 / c: プレイリスト新規作成 / q: 終了"
+            "Space: 再生/一時停止  "
+            f"→/+{self.config.config.skip_seconds}s  ←/-{self.config.config.skip_seconds}s  "
+            "↑前  ↓次  "
+            "上3段: 追加  Ctrl+上3段: バンク2  ,/.: バンク固定  Ctrl+G: 再生中へ  "
+            "b:割当  v:更新  c:作成  m:終了"
         )
-        ttk.Label(help_frame, text=help_text, justify=tk.LEFT).pack(anchor="w", padx=8, pady=6)
+        ttk.Label(help_frame, text=help_text, justify=tk.LEFT).pack(anchor="w", padx=6, pady=4)
 
     def bind_keys(self):
-        self.root.bind("<KeyPress>", self.on_key)
+        self.root.bind_all("<KeyPress>", self.on_key)
+
+    def normalize_key(self, keysym: str) -> str:
+        k = (keysym or "").lower()
+        alias = {
+            'minus': '-',
+            'equal': '=',
+            'bracketleft': '[',
+            'bracketright': ']',
+            'backslash': '\\',
+            'semicolon': ';',
+            'apostrophe': "'",
+            'comma': ',',
+            'period': '.',
+        }
+        return alias.get(k, keysym)
+
+    def update_slot_labels(self):
+        base = self.slot_bank * self.bank_size
+
+        try:
+            self.slots_page_label.configure(text=f"バンク: {self.slot_bank + 1}/2")
+        except Exception:
+            pass
+
+        for i in range(self.bank_size):
+            idx = base + i
+            name = self.quick_slots[idx] if idx < len(self.quick_slots) else "(未設定)"
+            key_label = self.slot_keys[i]
+            self.slot_labels[i].configure(text=f"{key_label}: {name}")
+
+    def toggle_slot_bank(self):
+        self.slot_bank = 0 if self.slot_bank else 1
+        self.update_slot_labels()
+        self.last_action = f"バンク: {self.slot_bank + 1}"
 
     def on_key(self, event: tk.Event):
-        k = event.keysym
-        # Slots by function keys F1..F12 => 0..11, digits 1..9,0 => 12..21 (supports numpad)
-        if k.startswith("F") and k[1:].isdigit():
-            fn = int(k[1:])
-            if 1 <= fn <= 12:
-                self.add_to_slot(fn - 1)
-                return "break"
-        # digits top row or numpad
-        if (k in tuple("1234567890")) or (k.startswith("KP_") and k[-1] in "1234567890"):
-            d = k[-1]
-            order = "1234567890"
-            idx = 12 + order.index(d)
+        k = self.normalize_key(event.keysym)
+
+        # Ctrl+G is reserved for navigation
+        if k == 'g' and (event.state & 0x4):
+            self.goto_current_track(); return "break"
+
+        is_ctrl = bool(event.state & 0x4)
+        eff_bank = 1 if is_ctrl else self.slot_bank
+        if k in self.slot_keys:
+            idx = eff_bank * self.bank_size + self.slot_keys.index(k)
             self.add_to_slot(idx)
             return "break"
+        if k == ',':
+            self.toggle_slot_bank(); return "break"
+        if k == '.':
+            self.toggle_slot_bank(); return "break"
         if k == "space":
             self.toggle_play_pause(); return "break"
         if k == "Right":
@@ -315,17 +424,15 @@ class ITunesTkApp:
             self.prev_track(); return "break"
         if k == "Down":
             self.next_track(); return "break"
-        if k in ("p", "P"):
+        if k == "b":
             self.pick_slots(); return "break"
-        if k in ("r", "R"):
+        if k == "v":
             self.refresh_playlists(); return "break"
         if k == "c":
             self.create_single_playlist(); return "break"
-        if k in ("t", "T"):
-            self.tap_bpm(); return "break"
-        if k in ("x", "X"):
+        if k == "x":
             self.reset_bpm(); return "break"
-        if k in ("q", "Q"):
+        if k == "m":
             self.root.destroy(); return "break"
         if k == "g" and (event.state & 0x4):  # Ctrl+G
             self.goto_current_track(); return "break"
@@ -366,16 +473,14 @@ class ITunesTkApp:
         if not names:
             messagebox.showerror("エラー", "プレイリスト一覧を取得できませんでした")
             return
-        dlg = PlaylistPicker(self.root, names, preselected=self.quick_slots, max_select=self.slot_count)
+        dlg = PlaylistPicker(self.root, names, preselected=self.quick_slots, max_select=len(names))
         self.root.wait_window(dlg)
         if dlg.result is None:
             return
-        self.quick_slots = dlg.result[: self.slot_count]
+        self.quick_slots = list(dlg.result)
         self.config.set_quick_slots(self.quick_slots)
-        for i in range(self.slot_count):
-            name = self.quick_slots[i] if i < len(self.quick_slots) else "(未設定)"
-            key_label = self.slot_keys[i]
-            self.slot_labels[i].configure(text=f"{key_label}: {name}")
+        self.slot_bank = 0
+        self.update_slot_labels()
         self.last_action = "クイックスロット更新"
 
     def create_single_playlist(self):
@@ -411,41 +516,220 @@ class ITunesTkApp:
             if not selection:
                 return
             playlist_name = self.playlist_listbox.get(selection[0])
+            
+            # 即座に再生を開始（OLE呼び出し）
+            if hasattr(self.ctrl, 'play_playlist'):
+                self.ctrl.play_playlist(playlist_name)
+            
+            # トラック一覧の読み込み（バックグラウンド）
             self.load_tracks(playlist_name)
-            self.last_action = f"プレイリスト選択: {playlist_name}"
+            self.last_action = f"プレイリスト再生・選択: {playlist_name}"
         except Exception as e:
             print(f"プレイリスト選択エラー: {e}")
     
     def load_tracks(self, playlist_name: str):
-        """トラック一覧を読み込む"""
+        """トラック一覧をバックグラウンドCOMワーカー経由でプログレッシブに読み込む"""
+        # 既存ワーカーをキャンセル
+        if self._track_loading_cancel_event is not None:
+            self._track_loading_cancel_event.set()
+        if self._track_loading_thread is not None and self._track_loading_thread.is_alive():
+            self._track_loading_thread.join(timeout=0.2)
+
+        # 状態を初期化
+        self._track_loading_queue = queue.Queue()
+        self._track_loading_cancel_event = threading.Event()
+        self._track_loading_playlist = playlist_name
+
+        info = self.ctrl.get_current_track_info()
+        self._track_loading_dbid = info.get("dbid") if info else None
+
+        # トラック一覧をクリア
+        self.track_tree.delete(*self.track_tree.get_children())
         try:
-            tracks = self.ctrl.get_playlist_tracks(playlist_name)
-            print(f"トラック取得: {playlist_name} - {len(tracks)}曲")
-            self.track_tree.delete(*self.track_tree.get_children())
+            self._track_tree_item_meta.clear()
+        except Exception:
+            pass
+
+        # ワーカー起動（Tkに触らない）
+        def _on_batch(batch: list[dict]) -> None:
+            if self._track_loading_queue is not None:
+                self._track_loading_queue.put(batch)
+
+        if not self._library_xml_exists:
+            self.last_action = "XML未設定/未検出のためトラック一覧を取得できません"
+            try:
+                messagebox.showerror("エラー", "ライブラリXMLが見つからないためトラック一覧を取得できません")
+            except Exception:
+                pass
+            return
+
+        ok = False
+        try:
+            ok = self._load_library_xml_if_needed()
+        except Exception:
+            ok = False
+        if not ok:
+            self.last_action = "XML読込失敗"
+            try:
+                messagebox.showerror("エラー", "ライブラリXMLの読み込みに失敗しました")
+            except Exception:
+                pass
+            return
+
+        with self._library_xml_lock:
+            pls = self._library_xml_playlists or []
+        if not any((p.get('Name') == playlist_name) for p in pls if isinstance(p, dict)):
+            self.last_action = f"XMLにプレイリストがありません: {playlist_name}"
+            try:
+                messagebox.showerror("エラー", f"XMLにプレイリストがありません: {playlist_name}")
+            except Exception:
+                pass
+            return
+
+        self._track_loading_thread = threading.Thread(
+            target=self._stream_playlist_tracks_from_xml_worker,
+            args=(playlist_name, 50, _on_batch, self._track_loading_cancel_event),
+            daemon=True,
+        )
+        self._track_loading_thread.start()
+
+        # キューポーリング開始
+        self._poll_track_queue()
+
+    def _poll_track_queue(self):
+        """バックグラウンドワーカーから届いたトラックバッチをUIに反映"""
+        q = self._track_loading_queue
+        if q is None:
+            return
+
+        # 1回の呼び出しで処理するバッチ数を制限して、UIスレッドを占有しすぎないようにする
+        max_batches_per_tick = 3
+        processed = 0
+        try:
+            while processed < max_batches_per_tick:
+                batch = q.get_nowait()
+                self._display_tracks_batch_sync(batch, self._track_loading_dbid)
+                processed += 1
+        except queue.Empty:
+            pass
+
+        # まだワーカーが動いているか、キューに残りがあれば再スケジュール
+        worker_alive = (
+            self._track_loading_thread is not None
+            and self._track_loading_thread.is_alive()
+            and self._track_loading_cancel_event is not None
+            and not self._track_loading_cancel_event.is_set()
+        )
+        if worker_alive or (not q.empty()):
+            self.root.after(30, self._poll_track_queue)
+        else:
+            # ワーカー完了: 保存されたdbidでトラックをハイライト
+            if self._track_loading_dbid is not None:
+                self._highlight_track_by_dbid(self._track_loading_dbid)
+
+    def _display_tracks_batch_sync(self, tracks, current_dbid):
+        """トラックのバッチをUIに表示（同期実行）"""
+        # PlayOrderIndex順にソート
+        tracks.sort(key=lambda x: x.get('play_order', 0))
+        
+        for track in tracks:
+            if (
+                self._track_loading_cancel_event is not None
+                and self._track_loading_cancel_event.is_set()
+            ):
+                return
             
-            # 現在のトラックのDBIDを取得
-            info = self.ctrl.get_current_track_info()
-            current_dbid = info.get('dbid') if info else None
+            duration = track.get('duration', 0)
+            m, s = divmod(duration, 60)
+            time_str = f"{m:02d}:{s:02d}"
+
+            date_added = track.get('date_added')
+            purchase_date = track.get('purchase_date')
+            date_added_str = self._format_track_date(date_added)
+            purchase_date_str = self._format_track_date(purchase_date)
             
-            for track in tracks:
-                duration = track.get('duration', 0)
-                m, s = divmod(duration, 60)
-                time_str = f"{m:02d}:{s:02d}"
-                
-                # 現在再生中の曲をハイライト
-                tags = ('playing',) if track.get('dbid') == current_dbid else ()
-                
-                # DBIDをタグとして保存
-                dbid_tag = f"dbid:{track.get('dbid')}"
-                item_tags = tags + (dbid_tag,)
-                
-                self.track_tree.insert('', 'end', 
+            # 現在再生中の曲をハイライト
+            tags = ('playing',) if track.get('dbid') == current_dbid else ()
+            
+            # DBIDとIITObject IDs、Persistent ID、PlayOrderをタグとして保存
+            dbid_tag = f"dbid:{track.get('dbid')}"
+            pid_tag = f"pid:{track.get('persistent_id')}"
+            src_tag = f"src:{track.get('source_id')}"
+            pl_tag = f"pl:{track.get('playlist_id')}"
+            trk_tag = f"tid:{track.get('track_id')}"
+            loc_tag = f"loc:{track.get('location')}"
+            po_tag = f"po:{track.get('play_order')}"
+            item_tags = tags + (dbid_tag, pid_tag, src_tag, pl_tag, trk_tag, loc_tag, po_tag)
+            
+            try:
+                iid = self.track_tree.insert('', 'end',
                     text=track.get('name', ''),
-                    values=(track.get('artist', ''), track.get('album', ''), time_str),
+                    values=(
+                        track.get('artist', ''),
+                        track.get('album', ''),
+                        time_str,
+                        date_added_str,
+                        purchase_date_str,
+                    ),
                     tags=item_tags)
+                self._track_tree_item_meta[iid] = {
+                    'name': track.get('name', '') or '',
+                    'artist': track.get('artist', '') or '',
+                    'album': track.get('album', '') or '',
+                    'duration': int(duration or 0),
+                    'date_added': date_added,
+                    'purchase_date': purchase_date,
+                    'play_order': int(track.get('play_order') or 0),
+                }
                 self.track_tree.tag_configure('playing', background='#e0f0ff')
-        except Exception as e:
-            print(f"トラック読み込みエラー: {e}")
+            except Exception:
+                pass
+
+    def _format_track_date(self, dt) -> str:
+        try:
+            if dt is None:
+                return ""
+            # plistlibはdatetimeを返すことが多い
+            if hasattr(dt, 'strftime'):
+                return dt.strftime("%Y-%m-%d")
+            return str(dt)
+        except Exception:
+            return ""
+
+    def sort_track_tree(self, key: str):
+        reverse = bool(self._track_tree_sort_reverse.get(key, False))
+        self._track_tree_sort_reverse[key] = not reverse
+
+        def _sort_value(iid: str):
+            meta = self._track_tree_item_meta.get(iid) or {}
+            if key == 'name':
+                return (meta.get('name') or '').casefold()
+            if key == 'artist':
+                return (meta.get('artist') or '').casefold()
+            if key == 'album':
+                return (meta.get('album') or '').casefold()
+            if key == 'time':
+                return int(meta.get('duration') or 0)
+            if key == 'date_added':
+                v = meta.get('date_added')
+                return v if v is not None else ''
+            if key == 'purchase_date':
+                v = meta.get('purchase_date')
+                return v if v is not None else ''
+            return (meta.get(key) or '')
+
+        items = list(self.track_tree.get_children(''))
+        try:
+            items.sort(key=_sort_value, reverse=reverse)
+        except Exception:
+            # 日付/混在型などで比較に失敗した場合は文字列化で再ソート
+            items.sort(key=lambda iid: str(_sort_value(iid)), reverse=reverse)
+
+        for idx, iid in enumerate(items):
+            try:
+                self.track_tree.move(iid, '', idx)
+            except Exception:
+                pass
     
     def on_track_select(self, event):
         """トラック選択時（ダブルクリック）"""
@@ -456,24 +740,188 @@ class ITunesTkApp:
             item = selection[0]
             tags = self.track_tree.item(item, 'tags')
             
-            # DBIDを取得
-            dbid = None
+            # DBID, Persistent ID, IITObject IDsを取得
+            dbid: int | None = None
+            pid: str | None = None
+            source_id: int | None = None
+            playlist_id: int | None = None
+            track_id: int | None = None
+            play_order: int | None = None
+            location: str | None = None
+
             for tag in tags:
-                if tag.startswith('dbid:'):
-                    try:
-                        dbid = int(tag.split(':')[1])
-                        break
-                    except:
-                        pass
+                try:
+                    if tag.startswith('dbid:'):
+                        v = tag.split(':', 1)[1]
+                        dbid = int(v) if v not in (None, '', 'None') else None
+                    elif tag.startswith('pid:'):
+                        v = tag.split(':', 1)[1]
+                        pid = v if v not in (None, '', 'None') else None
+                    elif tag.startswith('src:'):
+                        v = tag.split(':', 1)[1]
+                        source_id = int(v) if v not in (None, '', 'None') else None
+                    elif tag.startswith('pl:'):
+                        v = tag.split(':', 1)[1]
+                        playlist_id = int(v) if v not in (None, '', 'None') else None
+                    elif tag.startswith('tid:'):
+                        v = tag.split(':', 1)[1]
+                        track_id = int(v) if v not in (None, '', 'None') else None
+                    elif tag.startswith('po:'):
+                        v = tag.split(':', 1)[1]
+                        play_order = int(v) if v not in (None, '', 'None') else None
+                    elif tag.startswith('loc:'):
+                        v = tag.split(':', 1)[1]
+                        location = v if v not in (None, '', 'None') else None
+                except Exception:
+                    continue
             
-            if dbid:
-                ok = self.ctrl.play_track_by_dbid(dbid)
-                if ok:
-                    self.last_action = f"トラック再生: {self.track_tree.item(item, 'text')}"
-                else:
-                    self.last_action = "トラック再生失敗"
+            ok = False
+            track_name = self.track_tree.item(item, 'text') or None
+            current_playlist = self._track_loading_playlist
+            if pid or dbid is not None:
+                ok = self.ctrl.play_track_by_ids(
+                    source_id, playlist_id, track_id, dbid, pid, track_name, current_playlist, play_order
+                )
+            elif location:
+                fn = getattr(self.ctrl, 'play_track_by_location', None)
+                if callable(fn):
+                    ok = bool(fn(location))
+
+            if ok:
+                self.last_action = f"トラック再生: {self.track_tree.item(item, 'text')}"
+            else:
+                self.last_action = "トラック再生失敗"
         except Exception as e:
             print(f"トラック選択エラー: {e}")
+
+    def _load_library_xml_if_needed(self) -> bool:
+        """ライブラリXMLを必要時に読み込み、キャッシュする。成功でTrue。"""
+        path = self._library_xml_path
+        if not path:
+            return False
+        try:
+            st = os.stat(path)
+            mtime = float(st.st_mtime)
+        except Exception:
+            return False
+
+        with self._library_xml_lock:
+            if (
+                self._library_xml_tracks is not None
+                and self._library_xml_playlists is not None
+                and self._library_xml_mtime == mtime
+            ):
+                return True
+            try:
+                with open(path, 'rb') as f:
+                    data = plistlib.load(f)
+                tracks = data.get('Tracks') or {}
+                playlists = data.get('Playlists') or []
+                if not isinstance(tracks, dict) or not isinstance(playlists, list):
+                    return False
+                # Tracksのキーは文字列のTrack IDが多い
+                self._library_xml_tracks = tracks
+                self._library_xml_playlists = playlists
+                self._library_xml_mtime = mtime
+                return True
+            except Exception:
+                return False
+
+    def _stream_playlist_tracks_from_xml_worker(
+        self,
+        playlist_name: str,
+        batch_size: int,
+        on_batch,
+        cancel_event: threading.Event | None,
+    ) -> None:
+        """XML(plist)からプレイリストのトラック一覧を抽出してバッチで返す（バックグラウンド用）"""
+        try:
+            ok = self._load_library_xml_if_needed()
+            if not ok:
+                # XMLが読めない場合は、呼び出し元でフォールバックしない（現状はXML優先時のみ呼ぶ）ため、空で返す
+                return
+            with self._library_xml_lock:
+                tracks_dict = self._library_xml_tracks or {}
+                playlists = self._library_xml_playlists or []
+        except Exception:
+            return
+
+        target_pl = None
+        for pl in playlists:
+            try:
+                if pl.get('Name') == playlist_name:
+                    target_pl = pl
+                    break
+            except Exception:
+                continue
+        if not target_pl:
+            return
+
+        items = target_pl.get('Playlist Items') or []
+        if not isinstance(items, list):
+            return
+
+        batch: list[dict] = []
+        for idx, it in enumerate(items, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            try:
+                tid = it.get('Track ID')
+            except Exception:
+                tid = None
+            if tid is None:
+                continue
+            t = None
+            try:
+                t = tracks_dict.get(str(tid))
+            except Exception:
+                t = None
+            if not isinstance(t, dict):
+                continue
+
+            total_ms = 0
+            try:
+                total_ms = int(t.get('Total Time') or 0)
+            except Exception:
+                total_ms = 0
+            duration_sec = max(0, int(round(total_ms / 1000.0)))
+
+            # XMLの Track ID は COMの TrackDatabaseID と一致する
+            try:
+                dbid = int(tid) if tid is not None else None
+            except Exception:
+                dbid = None
+
+            track = {
+                'name': t.get('Name', ''),
+                'artist': t.get('Artist', ''),
+                'album': t.get('Album', ''),
+                'duration': duration_sec,
+                'play_order': idx,
+                'dbid': dbid,
+                'persistent_id': t.get('Persistent ID'),
+                'source_id': None,
+                'playlist_id': None,
+                'track_id': tid,
+                'location': t.get('Location', ''),
+                'date_added': t.get('Date Added'),
+                'purchase_date': t.get('Purchase Date'),
+            }
+            batch.append(track)
+            if len(batch) >= batch_size:
+                try:
+                    on_batch(batch)
+                except Exception:
+                    pass
+                batch = []
+
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if batch:
+            try:
+                on_batch(batch)
+            except Exception:
+                pass
     
     def on_progress_change(self, value):
         """プログレスバー変更時"""
@@ -491,9 +939,9 @@ class ITunesTkApp:
     # トグルメソッド
     def toggle_progress(self):
         if self.show_progress.get():
-            self.progress_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+            self.progress_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 4))
         else:
-            self.progress_frame.pack_forget()
+            self.progress_frame.grid_remove()
     
     def toggle_playlists(self):
         if self.show_playlists.get():
@@ -513,9 +961,9 @@ class ITunesTkApp:
     
     def toggle_bpm(self):
         if self.show_bpm.get():
-            self.bpm_frame.pack(fill=tk.X, pady=(6, 0))
+            self.bpm_frame.grid(row=0, column=1, sticky="e", padx=8, pady=(6, 2))
         else:
-            self.bpm_frame.pack_forget()
+            self.bpm_frame.grid_remove()
     
     def toggle_slots(self):
         if self.show_slots.get():
@@ -576,6 +1024,73 @@ class ITunesTkApp:
         except Exception as e:
             print(f"再生中の曲へ移動エラー: {e}")
 
+    def _sync_to_itunes_state(self):
+        """iTunesの現在の再生状態をUIに反映する（起動直後用）"""
+        try:
+            info = self.ctrl.get_current_track_info()
+            if not info:
+                return
+            cur_dbid = info.get('dbid')
+            cur_playlist = info.get('playlist')
+            if cur_dbid is None:
+                return
+            self._synced_dbid = cur_dbid
+            self._synced_playlist = cur_playlist
+            self._on_track_changed(cur_playlist, cur_dbid)
+        except Exception as e:
+            print(f"起動時同期エラー: {e}")
+
+    def _on_track_changed(self, playlist_name: str | None, dbid: int | None):
+        """曲が変わったときにUIのプレイリスト選択とトラックハイライトを更新する"""
+        if not playlist_name:
+            # プレイリスト不明の場合はトラックハイライトのみ試みる
+            if dbid is not None:
+                self._highlight_track_by_dbid(dbid)
+            return
+
+        # 現在表示中のプレイリストと同じなら、トラックハイライトのみ更新
+        if self._track_loading_playlist == playlist_name:
+            if dbid is not None:
+                self._highlight_track_by_dbid(dbid)
+            return
+
+        # 別のプレイリストに変わった場合: プレイリスト選択を更新してトラック一覧を読み込む
+        self._select_playlist_in_listbox(playlist_name)
+        self.load_tracks(playlist_name)
+        # トラック一覧の読み込み完了後にハイライトするため、dbidを保存
+        self._track_loading_dbid = dbid
+
+    def _select_playlist_in_listbox(self, playlist_name: str):
+        """プレイリストリストボックスで指定名のプレイリストを選択状態にする"""
+        try:
+            for i in range(self.playlist_listbox.size()):
+                if self.playlist_listbox.get(i) == playlist_name:
+                    self.playlist_listbox.selection_clear(0, tk.END)
+                    self.playlist_listbox.selection_set(i)
+                    self.playlist_listbox.see(i)
+                    return
+        except Exception:
+            pass
+
+    def _highlight_track_by_dbid(self, dbid: int):
+        """トラック一覧で指定DBIDのトラックを選択・ハイライトする"""
+        try:
+            for item in self.track_tree.get_children():
+                tags = self.track_tree.item(item, 'tags')
+                for tag in tags:
+                    if tag.startswith('dbid:'):
+                        try:
+                            item_dbid = int(tag.split(':', 1)[1])
+                            if item_dbid == dbid:
+                                self.track_tree.selection_set(item)
+                                self.track_tree.see(item)
+                                self.track_tree.focus(item)
+                                return
+                        except (ValueError, IndexError):
+                            pass
+        except Exception:
+            pass
+
     def update_ui_loop(self):
         info = self.ctrl.get_current_track_info()
         if info:
@@ -594,6 +1109,17 @@ class ITunesTkApp:
             if not self._seeking and dur > 0:
                 progress = (pos / dur) * 100
                 self.progress_bar.set(progress)
+
+            # 曲変更検知: dbid またはプレイリストが変わったら同期
+            cur_dbid = info.get('dbid')
+            cur_playlist = info.get('playlist')
+            if cur_dbid is not None and (
+                cur_dbid != self._synced_dbid or cur_playlist != self._synced_playlist
+            ):
+                self._synced_dbid = cur_dbid
+                self._synced_playlist = cur_playlist
+                self._on_track_changed(cur_playlist, cur_dbid)
+
         # BPM表示更新
         if self.bpm_value:
             self.bpm_label.configure(text=f"BPM: {self.bpm_value:.1f}")

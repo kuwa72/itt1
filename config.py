@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 try:
@@ -29,6 +30,15 @@ class AppConfig(BaseModel):
     refresh_interval: float = Field(
         default=0.25,
         description="画面更新間隔（秒）"
+    )
+
+    library_xml_path_windows: str = Field(
+        default="",
+        description="Windows iTunesのライブラリXMLパス（未設定の場合は標準パスを探索）"
+    )
+    library_xml_path_macos: str = Field(
+        default="",
+        description="macOS Music/iTunesのライブラリXMLパス（未設定の場合は標準パスを探索）"
     )
 
 
@@ -61,11 +71,63 @@ class ConfigManager:
             print(f"設定ファイル保存エラー: {e}")
     
     def get_quick_slots(self) -> List[str]:
-        """クイックスロット(最大22件)を取得（playlists フォールバックは廃止）。"""
+        """クイックスロットを取得（playlists フォールバックは廃止）。"""
         slots = self.config.quick_slots or []
-        return slots[:22]
+        return list(slots)
 
     def set_quick_slots(self, slots: List[str]):
-        """クイックスロット(最大22)を設定して保存"""
-        self.config.quick_slots = slots[:22]
+        """クイックスロットを設定して保存"""
+        self.config.quick_slots = list(slots)
         self.save_config()
+
+    def _detect_platform_name(self) -> str:
+        system = platform.system().lower()
+        if system == "windows":
+            return "windows"
+        if system == "darwin":
+            return "macos"
+        return system
+
+    def get_library_xml_path(self) -> str:
+        """設定または標準パス推測からライブラリXMLのパスを返す（見つからない場合は空文字）。"""
+        platform_name = self._detect_platform_name()
+        configured = ""
+        if platform_name == "windows":
+            configured = (self.config.library_xml_path_windows or "").strip()
+        elif platform_name == "macos":
+            configured = (self.config.library_xml_path_macos or "").strip()
+        if configured:
+            return os.path.expanduser(configured)
+
+        candidates: List[str] = []
+        if platform_name == "windows":
+            base = os.path.expanduser("~")
+            candidates.extend([
+                os.path.join(base, "Music", "iTunes", "iTunes Music Library.xml"),
+                os.path.join(base, "Music", "iTunes", "iTunes Library.xml"),
+            ])
+        elif platform_name == "macos":
+            base = os.path.expanduser("~")
+            candidates.extend([
+                os.path.join(base, "Music", "iTunes", "iTunes Music Library.xml"),
+                os.path.join(base, "Music", "iTunes", "iTunes Library.xml"),
+                os.path.join(base, "Music", "Music", "Music Library.xml"),
+            ])
+
+        for p in candidates:
+            try:
+                if os.path.exists(p):
+                    return p
+            except Exception:
+                continue
+        return ""
+
+    def check_library_xml_exists(self) -> tuple[str, bool]:
+        """ライブラリXMLの存在チェック。("path", exists) を返す。"""
+        p = self.get_library_xml_path()
+        if not p:
+            return "", False
+        try:
+            return p, os.path.exists(p)
+        except Exception:
+            return p, False

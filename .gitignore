@@ -6,6 +6,18 @@ __pycache__/
 *.pyo
 *.pyd
 
+analyze_*.py
+check_*.py
+find_*.py
+inspect_*.py
+investigate_*.py
+list_*.py
+probe_*.py
+reproduce_*.py
+test_*.py
+verify_*.py
+investigate_*.bat
+
 # PyInstaller
 build/
 dist/
