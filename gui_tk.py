@@ -207,16 +207,19 @@ class ITunesTkApp:
         top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
         top_row.columnconfigure(0, weight=0)
         top_row.columnconfigure(1, weight=1)
+        top_row.columnconfigure(2, weight=0)
 
-        self.track_status = ttk.Label(top_row, text="⏸ 一時停止")
+        self.track_status = ttk.Label(top_row, text="⏸ 一時停止", font=("", 14, "bold"))
         self.track_status.grid(row=0, column=0, sticky="w")
-        self.track_title = ttk.Label(top_row, text="曲名: -", font=("", 10, "bold"))
+        self.track_title = ttk.Label(top_row, text="曲名: -", font=("", 16, "bold"))
         self.track_title.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.last_action_label = ttk.Label(top_row, text="最終アクション: 起動", foreground="#ff9800", font=("", 14, "bold"))
+        self.last_action_label.grid(row=0, column=2, sticky="e")
 
         # BPM panel (inside track panel)
         self.bpm_frame = ttk.Frame(track_frame)
         self.bpm_frame.grid(row=0, column=1, sticky="e", padx=8, pady=(6, 2))
-        self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -")
+        self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -", font=("", 12))
         self.bpm_label.pack(side=tk.LEFT)
         ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
@@ -226,11 +229,11 @@ class ITunesTkApp:
         meta_row.columnconfigure(0, weight=1)
         meta_row.columnconfigure(1, weight=1)
         meta_row.columnconfigure(2, weight=0)
-        self.track_artist = ttk.Label(meta_row, text="アーティスト: -")
+        self.track_artist = ttk.Label(meta_row, text="アーティスト: -", font=("", 12))
         self.track_artist.grid(row=0, column=0, sticky="w")
-        self.track_album = ttk.Label(meta_row, text="アルバム: -")
+        self.track_album = ttk.Label(meta_row, text="アルバム: -", font=("", 12))
         self.track_album.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        self.track_time = ttk.Label(meta_row, text="時間: 00:00 / 00:00")
+        self.track_time = ttk.Label(meta_row, text="時間: 00:00 / 00:00", font=("", 12))
         self.track_time.grid(row=0, column=2, sticky="e")
         
         # プログレスバー
@@ -244,11 +247,8 @@ class ITunesTkApp:
         bottom_row = ttk.Frame(track_frame)
         bottom_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
         bottom_row.columnconfigure(0, weight=1)
-        bottom_row.columnconfigure(1, weight=1)
-        self.track_in_playlists = ttk.Label(bottom_row, text="この曲の登録先: -", foreground="#666")
+        self.track_in_playlists = ttk.Label(bottom_row, text="この曲の登録先: -", foreground="#666", font=("", 10))
         self.track_in_playlists.grid(row=0, column=0, sticky="w")
-        self.last_action_label = ttk.Label(bottom_row, text="最終アクション: 起動", foreground="#008b8b")
-        self.last_action_label.grid(row=0, column=1, sticky="e")
         
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
@@ -263,6 +263,8 @@ class ITunesTkApp:
         playlist_toolbar.pack(fill=tk.X, padx=4, pady=4)
         goto_btn = ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10, takefocus=False)
         goto_btn.pack(side=tk.LEFT)
+        refresh_btn = ttk.Button(playlist_toolbar, text="リフレッシュ", command=self.refresh_current_playlist, width=10, takefocus=False)
+        refresh_btn.pack(side=tk.LEFT, padx=(4, 0))
         
         playlist_scroll = ttk.Scrollbar(self.playlist_frame)
         playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -271,12 +273,12 @@ class ITunesTkApp:
         self.playlist_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         playlist_scroll.config(command=self.playlist_listbox.yview)
         self.playlist_listbox.bind("<Double-Button-1>", self.on_playlist_select)
-        # プレイリスト一覧のキーを無効化（グローバルキーバインドと競合するため）
-        self.playlist_listbox.bind("<Up>", self.on_key)
-        self.playlist_listbox.bind("<Down>", self.on_key)
-        self.playlist_listbox.bind("<Left>", self.on_key)
-        self.playlist_listbox.bind("<Right>", self.on_key)
-        self.playlist_listbox.bind("<space>", self.on_key)
+        
+        # キーボードナビゲーション: ↑↓で選択、Enterで再生、Spaceで再生（グローバル優先）
+        self.playlist_listbox.bind("<Up>", self.on_playlist_nav_up)
+        self.playlist_listbox.bind("<Down>", self.on_playlist_nav_down)
+        self.playlist_listbox.bind("<Return>", self.on_playlist_enter)
+        self.playlist_listbox.bind("<space>", self.on_playlist_space)
         
         # トラック一覧
         self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
@@ -332,17 +334,37 @@ class ITunesTkApp:
         self.slots_page_label.pack(side=tk.LEFT)
         self.slots_hint_label = ttk.Label(header, text="上3段キーで追加  Ctrlでバンク2  ,/.でバンク固定切替", foreground="#666")
         self.slots_hint_label.pack(side=tk.RIGHT)
-        self.slot_labels: List[ttk.Label] = []
-        grid = ttk.Frame(self.slots_frame)
-        grid.pack(fill=tk.X, padx=6, pady=(2, 4))
-        columns = 9
-        for c in range(columns):
-            grid.columnconfigure(c, weight=1)
-        for i in range(self.bank_size):
-            lbl = ttk.Label(grid, text="")
-            r, c = divmod(i, columns)
-            lbl.grid(row=r, column=c, sticky="w", padx=4, pady=1)
-            self.slot_labels.append(lbl)
+        self.slot_labels: List[tk.Label] = []
+        # 数字行12, QWERTY行12, ASDF行11 と実際のキーボード上3段に対応
+        self.slot_key_rows = [12, 12, 11]
+        self._slot_default_bg = "#3a3a3a"
+        self._slot_default_fg = "#eeeeee"
+        self._slot_empty_fg = "#888888"
+        slots_container = tk.Frame(self.slots_frame, bg="#2b2b2b")
+        slots_container.pack(fill=tk.X, padx=4, pady=(2, 4))
+        for row_idx, row_len in enumerate(self.slot_key_rows):
+            row = tk.Frame(slots_container, bg="#2b2b2b")
+            row.pack(fill=tk.X, expand=True, pady=1)
+            for col in range(row_len):
+                slot_idx = sum(self.slot_key_rows[:row_idx]) + col
+                key_label = self.slot_keys[slot_idx]
+                lbl = tk.Label(
+                    row,
+                    text=f"{key_label}\n(未設定)",
+                    bg=self._slot_default_bg,
+                    fg=self._slot_empty_fg,
+                    font=("Yu Gothic UI", 10, "bold"),
+                    relief=tk.RIDGE,
+                    bd=1,
+                    padx=2,
+                    pady=2,
+                    width=8,
+                    height=2,
+                    anchor="center",
+                    justify="center",
+                )
+                lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
+                self.slot_labels.append(lbl)
         self.update_slot_labels()
         
         # プレイリストを読み込む
@@ -351,17 +373,37 @@ class ITunesTkApp:
         # Help
         help_frame = ttk.LabelFrame(container, text="操作")
         help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
+        
+        help_header = ttk.Frame(help_frame)
+        help_header.pack(fill=tk.X, padx=6, pady=4)
+        self.help_visible = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            help_header,
+            text="ヘルプ表示",
+            variable=self.help_visible,
+            command=self.toggle_help,
+            takefocus=False
+        ).pack(side=tk.LEFT)
+        
         help_text = (
-            "Space: 再生/一時停止  "
-            f"→/+{self.config.config.skip_seconds}s  ←/-{self.config.config.skip_seconds}s  "
-            "↑前  ↓次  "
-            "上3段: 追加  Ctrl+上3段: バンク2  ,/.: バンク固定  Ctrl+G: 再生中へ  "
-            "b:割当  v:更新  c:作成  m:終了"
+            "Space再生/停止  ←→スキップ  ↑↓曲  1-0/q/p/a/'追加  Ctrl+上段:バンク2  ,/.:バンク固定  "
+            "Ctrl+G:再生中へ  b:割当  v:更新  z:リフレッシュ  c:作成  m:終了"
         )
-        ttk.Label(help_frame, text=help_text, justify=tk.LEFT).pack(anchor="w", padx=6, pady=4)
+        self.help_label = ttk.Label(help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
+        self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
+        
+        # 初期状態で非表示にする場合は以下をコメントアウトし、self.help_visible = tk.BooleanVar(value=False) に変更
+        # self.help_label.pack_forget()
 
     def bind_keys(self):
         self.root.bind_all("<KeyPress>", self.on_key)
+
+    def toggle_help(self):
+        """ヘルプ表示のトグル"""
+        if self.help_visible.get():
+            self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
+        else:
+            self.help_label.pack_forget()
 
     def normalize_key(self, keysym: str) -> str:
         k = (keysym or "").lower()
@@ -386,11 +428,15 @@ class ITunesTkApp:
         except Exception:
             pass
 
-        for i in range(self.bank_size):
+        # リストとバンクサイズがずれている場合もクラッシュしないように、実際のラベル数でループ
+        for i, lbl in enumerate(self.slot_labels):
             idx = base + i
-            name = self.quick_slots[idx] if idx < len(self.quick_slots) else "(未設定)"
+            name = self.quick_slots[idx] if idx < len(self.quick_slots) else None
             key_label = self.slot_keys[i]
-            self.slot_labels[i].configure(text=f"{key_label}: {name}")
+            if name:
+                lbl.configure(text=f"{key_label}\n{name}", fg=self._slot_default_fg, bg=self._slot_default_bg)
+            else:
+                lbl.configure(text=f"{key_label}\n(未設定)", fg=self._slot_empty_fg, bg=self._slot_default_bg)
 
     def toggle_slot_bank(self):
         self.slot_bank = 0 if self.slot_bank else 1
@@ -428,6 +474,8 @@ class ITunesTkApp:
             self.pick_slots(); return "break"
         if k == "v":
             self.refresh_playlists(); return "break"
+        if k == "z":
+            self.refresh_current_playlist(); return "break"
         if k == "c":
             self.create_single_playlist(); return "break"
         if k == "x":
@@ -457,16 +505,40 @@ class ITunesTkApp:
         self.ctrl.play_previous_track(); self.last_action = "前の曲"
 
     def add_to_slot(self, idx: int):
+        widget_idx = idx % self.bank_size
         if 0 <= idx < len(self.quick_slots):
             name = self.quick_slots[idx]
             # Search APIベースなのでキャッシュ不要、即座に追加
-            ok = self.ctrl.add_to_playlist(name)
-            if ok:
+            result = self.ctrl.add_to_playlist(name)
+            if result == "already_exists":
+                self.last_action = f"既に存在: {name}"
+                self._flash_slot(widget_idx, "warning")
+            elif result == "added":
                 self.last_action = f"追加: {name}"
+                self._flash_slot(widget_idx, "success")
             else:
                 self.last_action = f"追加失敗: {name}"
+                self._flash_slot(widget_idx, "error")
         else:
             self.last_action = "未設定スロット"
+            self._flash_slot(widget_idx, "warning")
+
+    def _flash_slot(self, widget_idx: int, status: str):
+        """スロットを一瞬色でフィードバックする。status: success/error/warning"""
+        if not (0 <= widget_idx < len(self.slot_labels)):
+            return
+        colors = {
+            "success": ("#2e7d32", "#ffffff"),
+            "error": ("#b71c1c", "#ffffff"),
+            "warning": ("#7a5c00", "#ffffff"),
+        }
+        bg, fg = colors.get(status, (self._slot_default_bg, self._slot_default_fg))
+        lbl = self.slot_labels[widget_idx]
+        try:
+            lbl.configure(bg=bg, fg=fg)
+        except Exception:
+            return
+        self.root.after(300, lambda: self.update_slot_labels())
 
     def pick_slots(self):
         names = self.ctrl.get_all_playlists()
@@ -499,6 +571,27 @@ class ITunesTkApp:
         self.load_playlists()
         self.last_action = "プレイリスト更新"
     
+    def refresh_current_playlist(self):
+        """現在選択中のプレイリストをリフレッシュ（スマートプレイリストの再構築）"""
+        try:
+            selection = self.playlist_listbox.curselection()
+            if not selection:
+                self.last_action = "リフレッシュ: プレイリスト未選択"
+                return
+            playlist_name = self.playlist_listbox.get(selection[0])
+            
+            if hasattr(self.ctrl, 'refresh_playlist'):
+                ok = self.ctrl.refresh_playlist(playlist_name)
+                if ok:
+                    # トラック一覧も再読み込み
+                    self.load_tracks(playlist_name)
+                    self.last_action = f"リフレッシュ: {playlist_name}"
+                else:
+                    self.last_action = f"リフレッシュ失敗: {playlist_name}"
+        except Exception as e:
+            print(f"リフレッシュエラー: {e}")
+            self.last_action = "リフレッシュエラー"
+    
     def load_playlists(self):
         """プレイリスト一覧を読み込む"""
         try:
@@ -526,6 +619,48 @@ class ITunesTkApp:
             self.last_action = f"プレイリスト再生・選択: {playlist_name}"
         except Exception as e:
             print(f"プレイリスト選択エラー: {e}")
+    
+    def on_playlist_nav_up(self, event):
+        """プレイリスト一覧で上キー"""
+        try:
+            current = self.playlist_listbox.curselection()
+            if current:
+                idx = current[0]
+                if idx > 0:
+                    self.playlist_listbox.selection_clear(0, tk.END)
+                    self.playlist_listbox.selection_set(idx - 1)
+                    self.playlist_listbox.see(idx - 1)
+                    self.playlist_listbox.activate(idx - 1)
+        except Exception:
+            pass
+    
+    def on_playlist_nav_down(self, event):
+        """プレイリスト一覧で下キー"""
+        try:
+            current = self.playlist_listbox.curselection()
+            if current:
+                idx = current[0]
+                if idx < self.playlist_listbox.size() - 1:
+                    self.playlist_listbox.selection_clear(0, tk.END)
+                    self.playlist_listbox.selection_set(idx + 1)
+                    self.playlist_listbox.see(idx + 1)
+                    self.playlist_listbox.activate(idx + 1)
+        except Exception:
+            pass
+    
+    def on_playlist_enter(self, event):
+        """プレイリスト一覧でEnterキー（選択プレイリストを再生）"""
+        try:
+            selection = self.playlist_listbox.curselection()
+            if selection:
+                self.on_playlist_select(event)
+        except Exception:
+            pass
+    
+    def on_playlist_space(self, event):
+        """プレイリスト一覧でSpaceキー（グローバル再生/停止を優先）"""
+        # グローバルキーを優先させるため、何もしない
+        pass
     
     def load_tracks(self, playlist_name: str):
         """トラック一覧をバックグラウンドCOMワーカー経由でプログレッシブに読み込む"""

@@ -517,9 +517,10 @@ class WindowsMusicController:
             print(f"現在のプレイリスト取得エラー: {e}")
             return []
     
-    def add_to_playlist(self, playlist_name: str) -> bool:
+    def add_to_playlist(self, playlist_name: str) -> str | bool:
         """現在のトラックを指定されたプレイリストに追加。
         Search APIを使った高速な重複チェックを実行。
+        戻り値: "added"（新規追加）, "already_exists"（既に存在）, False（失敗）
         """
         if not self.itunes:
             return False
@@ -541,7 +542,7 @@ class WindowsMusicController:
                 # 情報が不足している場合は追加のみ試みる
                 if hasattr(target, 'AddTrack'):
                     target.AddTrack(current_track)
-                    return True
+                    return "added"
                 return False
             
             # Search APIで重複チェック（超高速: 0.04秒）
@@ -555,7 +556,7 @@ class WindowsMusicController:
                             try:
                                 if getattr(t, 'TrackDatabaseID', None) == track_dbid:
                                     # 既に存在
-                                    return True
+                                    return "already_exists"
                             except Exception:
                                 continue
                 except Exception:
@@ -565,7 +566,7 @@ class WindowsMusicController:
             # 重複なし → 追加
             if hasattr(target, 'AddTrack'):
                 target.AddTrack(current_track)
-                return True
+                return "added"
             
             return False
             
@@ -645,6 +646,24 @@ class WindowsMusicController:
         except Exception as e:
             print(f"プレイリスト一覧取得エラー: {e}")
         return names
+
+    def refresh_playlist(self, playlist_name: str) -> bool:
+        """指定されたプレイリストをリフレッシュ（スマートプレイリストの再構築）"""
+        if not self.itunes:
+            return False
+        try:
+            target = self._find_playlist_by_name(playlist_name)
+            if target is None:
+                return False
+            # スマートプレイリストの場合、Rebuild() で再構築
+            if hasattr(target, 'Rebuild'):
+                target.Rebuild()
+                return True
+            # 通常のプレイリストの場合は何もしない（リフレッシュ不要）
+            return True
+        except Exception as e:
+            print(f"プレイリストリフレッシュエラー: {e}")
+            return False
 
     def get_playlists_of_current_track(self) -> List[str]:
         """現在のトラックが含まれているプレイリスト名一覧を返す。

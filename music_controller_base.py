@@ -142,8 +142,8 @@ class MacOSMusicController:
     def get_all_playlists(self) -> List[str]:
         return [p['name'] for p in self.get_playlists()]
 
-    def add_to_playlist(self, playlist_name: str) -> bool:
-        """Add current track to playlist"""
+    def add_to_playlist(self, playlist_name: str) -> str | bool:
+        """Add current track to playlist. Returns: "added", "already_exists", or False"""
         script = f'''
         tell application "Music"
             try
