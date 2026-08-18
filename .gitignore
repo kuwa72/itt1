@@ -22,3 +22,7 @@ investigate_*.bat
 build/
 dist/
 *.spec
+
+# Virtualenv
+.venv/
+

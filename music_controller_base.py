@@ -262,3 +262,8 @@ class MacOSMusicController:
 
     def get_all_playlists_threadsafe(self) -> List[str]:
         return self.get_all_playlists()
+
+    @staticmethod
+    def get_play_order_mapping_threadsafe(playlist_name: str) -> Dict[int, int]:
+        """macOSでは PlayOrderIndex に相当するAPIがないため空のマッピングを返す。"""
+        return {}

@@ -4,6 +4,7 @@ from typing import List
 import os
 import plistlib
 import threading
+import time
 import queue
 from music_controller_base import create_music_controller
 from config import ConfigManager
@@ -131,6 +132,8 @@ class ITunesTkApp:
         self._library_xml_tracks: dict[str, dict] | None = None
         self._library_xml_playlists: list[dict] | None = None
         self._library_xml_lock = threading.Lock()
+        # プレイリスト一覧の表示ラベルに対応する実プレイリスト名（リストボックスのインデックスと対応）
+        self._playlist_raw_names: List[str] = []
         self.tap_times: List[float] = []
         self.bpm_value: float | None = None
         # ASCII keyboard top 3 rows: number row + QWERTY + ASDF (per-page)
@@ -160,6 +163,12 @@ class ITunesTkApp:
         self._track_loading_queue: "queue.Queue[list[dict]] | None" = None
         self._track_loading_playlist: str | None = None
         self._track_loading_dbid: int | None = None
+        # 手動選択による表示中は再生中プレイリストへの自動追従を抑止するフラグ
+        self._manual_playlist_view: bool = False
+        # シングルクリック表示の遅延実行ID（ダブルクリックとの競合回避用）
+        self._playlist_click_after_id = None
+        # ダブルクリック/Enterで再生した時刻（直後のButtonRelease由来の遅延実行を捨てるため）
+        self._last_playlist_play_at: float = 0.0
 
         # 曲変更検知用
         self._synced_dbid: int | None = None
@@ -221,7 +230,7 @@ class ITunesTkApp:
         self.bpm_frame.grid(row=0, column=1, sticky="e", padx=8, pady=(6, 2))
         self.bpm_label = ttk.Label(self.bpm_frame, text="BPM: -", font=("", 12))
         self.bpm_label.pack(side=tk.LEFT)
-        ttk.Button(self.bpm_frame, text="Tap (t)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.bpm_frame, text="Tap (/)", command=self.tap_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(self.bpm_frame, text="Reset (x)", command=self.reset_bpm, takefocus=False).pack(side=tk.LEFT, padx=(6, 0))
 
         meta_row = ttk.Frame(track_frame)
@@ -263,9 +272,7 @@ class ITunesTkApp:
         playlist_toolbar.pack(fill=tk.X, padx=4, pady=4)
         goto_btn = ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10, takefocus=False)
         goto_btn.pack(side=tk.LEFT)
-        refresh_btn = ttk.Button(playlist_toolbar, text="リフレッシュ", command=self.refresh_current_playlist, width=10, takefocus=False)
-        refresh_btn.pack(side=tk.LEFT, padx=(4, 0))
-        
+
         playlist_scroll = ttk.Scrollbar(self.playlist_frame)
         playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -273,7 +280,8 @@ class ITunesTkApp:
         self.playlist_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         playlist_scroll.config(command=self.playlist_listbox.yview)
         self.playlist_listbox.bind("<Double-Button-1>", self.on_playlist_select)
-        
+        self.playlist_listbox.bind("<ButtonRelease-1>", self.on_playlist_click)
+
         # キーボードナビゲーション: ↑↓で選択、Enterで再生、Spaceで再生（グローバル優先）
         self.playlist_listbox.bind("<Up>", self.on_playlist_nav_up)
         self.playlist_listbox.bind("<Down>", self.on_playlist_nav_down)
@@ -335,8 +343,8 @@ class ITunesTkApp:
         self.slots_hint_label = ttk.Label(header, text="上3段キーで追加  Ctrlでバンク2  ,/.でバンク固定切替", foreground="#666")
         self.slots_hint_label.pack(side=tk.RIGHT)
         self.slot_labels: List[tk.Label] = []
-        # 数字行12, QWERTY行12, ASDF行11 と実際のキーボード上3段に対応
-        self.slot_key_rows = [12, 12, 11]
+        # 数字行12, QWERTY行13, ASDF行11 と実際のキーボード上3段に対応
+        self.slot_key_rows = [12, 13, 11]
         self._slot_default_bg = "#3a3a3a"
         self._slot_default_fg = "#eeeeee"
         self._slot_empty_fg = "#888888"
@@ -386,8 +394,9 @@ class ITunesTkApp:
         ).pack(side=tk.LEFT)
         
         help_text = (
-            "Space再生/停止  ←→スキップ  ↑↓曲  1-0/q/p/a/'追加  Ctrl+上段:バンク2  ,/.:バンク固定  "
-            "Ctrl+G:再生中へ  b:割当  v:更新  z:リフレッシュ  c:作成  m:終了"
+            "Space再生/停止 ←→スキップ ↑↓曲送り  "
+            "上3段キーでスロット追加  Ctrl+上3段:バンク2  ,/.:バンク固定切替  "
+            "b:スロット割当  v:プレイリスト一覧更新  c:プレイリスト作成"
         )
         self.help_label = ttk.Label(help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
         self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
@@ -417,6 +426,7 @@ class ITunesTkApp:
             'apostrophe': "'",
             'comma': ',',
             'period': '.',
+            'slash': '/',
         }
         return alias.get(k, keysym)
 
@@ -444,6 +454,11 @@ class ITunesTkApp:
         self.last_action = f"バンク: {self.slot_bank + 1}"
 
     def on_key(self, event: tk.Event):
+        # 入力ボックス（Entry/Text）にフォーカスがある場合はホットキーを無効化
+        focus = self.root.focus_get()
+        if focus is not None and isinstance(focus, (tk.Entry, tk.Text, ttk.Entry, tk.Spinbox)):
+            return
+
         k = self.normalize_key(event.keysym)
 
         # Ctrl+G is reserved for navigation
@@ -474,10 +489,10 @@ class ITunesTkApp:
             self.pick_slots(); return "break"
         if k == "v":
             self.refresh_playlists(); return "break"
-        if k == "z":
-            self.refresh_current_playlist(); return "break"
         if k == "c":
             self.create_single_playlist(); return "break"
+        if k == "/":
+            self.tap_bpm(); return "break"
         if k == "x":
             self.reset_bpm(); return "break"
         if k == "m":
@@ -545,11 +560,15 @@ class ITunesTkApp:
         if not names:
             messagebox.showerror("エラー", "プレイリスト一覧を取得できませんでした")
             return
-        dlg = PlaylistPicker(self.root, names, preselected=self.quick_slots, max_select=len(names))
+        folder_map = self._get_playlist_folder_map()
+        labels = [self._playlist_display_label(n, folder_map) for n in names]
+        label_to_raw = dict(zip(labels, names))
+        preselected_labels = [self._playlist_display_label(n, folder_map) for n in self.quick_slots]
+        dlg = PlaylistPicker(self.root, labels, preselected=preselected_labels, max_select=len(names))
         self.root.wait_window(dlg)
         if dlg.result is None:
             return
-        self.quick_slots = list(dlg.result)
+        self.quick_slots = [label_to_raw[label] for label in dlg.result]
         self.config.set_quick_slots(self.quick_slots)
         self.slot_bank = 0
         self.update_slot_labels()
@@ -571,44 +590,102 @@ class ITunesTkApp:
         self.load_playlists()
         self.last_action = "プレイリスト更新"
     
-    def refresh_current_playlist(self):
-        """現在選択中のプレイリストをリフレッシュ（スマートプレイリストの再構築）"""
+    @staticmethod
+    def _playlist_display_label(name: str, folder_map: dict) -> str:
+        """一覧表示用ラベルを返す。フォルダ内なら 'フォルダ/名前' 形式"""
+        folder = folder_map.get(name)
+        return f"{folder}/{name}" if folder else name
+
+    def _get_playlist_folder_map(self) -> dict:
+        """ライブラリXMLから {プレイリスト名: フォルダパス} を構築して返す。XMLが使えない場合は空dict"""
         try:
-            selection = self.playlist_listbox.curselection()
-            if not selection:
-                self.last_action = "リフレッシュ: プレイリスト未選択"
-                return
-            playlist_name = self.playlist_listbox.get(selection[0])
-            
-            if hasattr(self.ctrl, 'refresh_playlist'):
-                ok = self.ctrl.refresh_playlist(playlist_name)
-                if ok:
-                    # トラック一覧も再読み込み
-                    self.load_tracks(playlist_name)
-                    self.last_action = f"リフレッシュ: {playlist_name}"
-                else:
-                    self.last_action = f"リフレッシュ失敗: {playlist_name}"
-        except Exception as e:
-            print(f"リフレッシュエラー: {e}")
-            self.last_action = "リフレッシュエラー"
-    
+            if not self._load_library_xml_if_needed():
+                return {}
+            with self._library_xml_lock:
+                playlists = self._library_xml_playlists or []
+        except Exception:
+            return {}
+
+        by_pid = {}
+        for p in playlists:
+            if isinstance(p, dict):
+                by_pid[p.get('Playlist Persistent ID')] = p
+
+        folder_map = {}
+        for p in playlists:
+            if not isinstance(p, dict):
+                continue
+            name = p.get('Name')
+            parent_pid = p.get('Parent Persistent ID')
+            if not name or not parent_pid:
+                continue
+            # 親フォルダのチェーンを辿って '上位/下位' のパスを組み立てる
+            parts = []
+            seen = set()
+            cur = by_pid.get(parent_pid)
+            while cur is not None and cur.get('Playlist Persistent ID') not in seen:
+                seen.add(cur.get('Playlist Persistent ID'))
+                parts.append(cur.get('Name'))
+                cur = by_pid.get(cur.get('Parent Persistent ID'))
+            if parts:
+                folder_map[name] = '/'.join(reversed(parts))
+        return folder_map
+
     def load_playlists(self):
         """プレイリスト一覧を読み込む"""
         try:
             playlists = self.ctrl.get_playlists()
+            folder_map = self._get_playlist_folder_map()
+            self._playlist_raw_names = []
             self.playlist_listbox.delete(0, tk.END)
             for pl in playlists:
-                self.playlist_listbox.insert(tk.END, pl['name'])
+                name = pl['name']
+                self._playlist_raw_names.append(name)
+                self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
         except Exception as e:
             print(f"プレイリスト読み込みエラー: {e}")
-    
-    def on_playlist_select(self, event):
-        """プレイリスト選択時"""
+
+    def on_playlist_click(self, event):
+        """シングルクリック: 再生せずに選択プレイリストのトラック一覧だけ表示する。
+        ダブルクリック時もButtonReleaseが先行するため、遅延実行してダブルクリック側に譲る。
+        """
+        try:
+            if self._playlist_click_after_id is not None:
+                self.root.after_cancel(self._playlist_click_after_id)
+            self._playlist_click_after_id = self.root.after(250, self._show_selected_playlist_tracks)
+        except Exception:
+            pass
+
+    def _show_selected_playlist_tracks(self):
+        """選択中プレイリストのトラック一覧を表示（再生は行わない）"""
+        self._playlist_click_after_id = None
+        # ダブルクリック/Enter直後のButtonRelease由来の遅延実行は捨てる
+        if time.monotonic() - self._last_playlist_play_at < 0.5:
+            return
         try:
             selection = self.playlist_listbox.curselection()
             if not selection:
                 return
-            playlist_name = self.playlist_listbox.get(selection[0])
+            playlist_name = self._playlist_raw_names[selection[0]]
+            self._manual_playlist_view = True
+            self.load_tracks(playlist_name)
+            self.last_action = f"トラック一覧表示: {playlist_name}"
+        except Exception as e:
+            print(f"プレイリスト表示エラー: {e}")
+
+    def on_playlist_select(self, event):
+        """プレイリスト選択時（ダブルクリック/Enter: 再生してトラック一覧表示）"""
+        try:
+            # シングルクリック表示の遅延実行が残っていればキャンセル
+            if self._playlist_click_after_id is not None:
+                self.root.after_cancel(self._playlist_click_after_id)
+                self._playlist_click_after_id = None
+            self._manual_playlist_view = False
+            self._last_playlist_play_at = time.monotonic()
+            selection = self.playlist_listbox.curselection()
+            if not selection:
+                return
+            playlist_name = self._playlist_raw_names[selection[0]]
             
             # 即座に再生を開始（OLE呼び出し）
             if hasattr(self.ctrl, 'play_playlist'):
@@ -996,7 +1073,7 @@ class ITunesTkApp:
         if not isinstance(items, list):
             return
 
-        batch: list[dict] = []
+        all_tracks: list[dict] = []
         for idx, it in enumerate(items, 1):
             if cancel_event is not None and cancel_event.is_set():
                 return
@@ -1042,19 +1119,32 @@ class ITunesTkApp:
                 'date_added': t.get('Date Added'),
                 'purchase_date': t.get('Purchase Date'),
             }
-            batch.append(track)
-            if len(batch) >= batch_size:
-                try:
-                    on_batch(batch)
-                except Exception:
-                    pass
-                batch = []
+            all_tracks.append(track)
 
         if cancel_event is not None and cancel_event.is_set():
             return
-        if batch:
+
+        # 追加日降順（新しい順）でソート（iTunes側も追加日降順ソートの前提。低速なCOMの表示順取得は行わない）
+        # 同着はXMLのプレイリスト順を維持（安定ソート）、追加日不明は末尾
+        dated = [t for t in all_tracks if t.get('date_added') is not None]
+        undated = [t for t in all_tracks if t.get('date_added') is None]
+        dated.sort(key=lambda x: x.get('date_added'), reverse=True)
+        all_tracks = dated + undated
+        for pos, tr in enumerate(all_tracks, 1):
+            tr['play_order'] = pos
+
+        # バッチ分割して送信
+        if batch_size <= 0:
+            batch_size_local = len(all_tracks) or 1
+        else:
+            batch_size_local = batch_size
+
+        for start in range(0, len(all_tracks), batch_size_local):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            chunk = all_tracks[start:start + batch_size_local]
             try:
-                on_batch(batch)
+                on_batch(chunk)
             except Exception:
                 pass
     
@@ -1109,6 +1199,7 @@ class ITunesTkApp:
     def goto_current_track(self):
         """現在再生中のプレイリストとトラックに移動"""
         try:
+            self._manual_playlist_view = False
             # 現在のプレイリストを取得
             if not self.ctrl.itunes:
                 return
@@ -1124,13 +1215,8 @@ class ITunesTkApp:
                 return
             
             # プレイリスト一覧から該当プレイリストを選択
-            for i in range(self.playlist_listbox.size()):
-                if self.playlist_listbox.get(i) == playlist_name:
-                    self.playlist_listbox.selection_clear(0, tk.END)
-                    self.playlist_listbox.selection_set(i)
-                    self.playlist_listbox.see(i)
-                    break
-            
+            self._select_playlist_in_listbox(playlist_name)
+
             # トラック一覧を読み込む
             self.load_tracks(playlist_name)
             
@@ -1189,6 +1275,10 @@ class ITunesTkApp:
                 self._highlight_track_by_dbid(dbid)
             return
 
+        # 手動選択で別プレイリストを表示中は、再生中プレイリストへの自動追従をしない
+        if self._manual_playlist_view:
+            return
+
         # 別のプレイリストに変わった場合: プレイリスト選択を更新してトラック一覧を読み込む
         self._select_playlist_in_listbox(playlist_name)
         self.load_tracks(playlist_name)
@@ -1198,8 +1288,8 @@ class ITunesTkApp:
     def _select_playlist_in_listbox(self, playlist_name: str):
         """プレイリストリストボックスで指定名のプレイリストを選択状態にする"""
         try:
-            for i in range(self.playlist_listbox.size()):
-                if self.playlist_listbox.get(i) == playlist_name:
+            for i, raw in enumerate(self._playlist_raw_names):
+                if raw == playlist_name:
                     self.playlist_listbox.selection_clear(0, tk.END)
                     self.playlist_listbox.selection_set(i)
                     self.playlist_listbox.see(i)

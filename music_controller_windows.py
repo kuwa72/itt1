@@ -5,6 +5,10 @@ import os
 import threading
 from urllib.parse import urlparse, unquote
 
+# iTunesタイプライブラリの ITUserPlaylistSpecialKindFolder。
+# 旧SDKドキュメントでは 1 と記載されるが、実際のタイプライブラリ(iTunes 1.13)では 4。
+IT_USER_PLAYLIST_SPECIAL_KIND_FOLDER = 4
+
 
 class WindowsMusicController:
     """iTunes OLE操作を管理するクラス"""
@@ -124,11 +128,29 @@ class WindowsMusicController:
         except Exception:
             pass
     
+    @staticmethod
+    def _is_folder_playlist(playlist: Any) -> bool:
+        """フォルダプレイリストかどうかを SpecialKind で判定する。
+
+        gen_py静的ラッパー経由では IITPlaylist に SpecialKind が存在しないため、
+        AttributeError の場合は IITUserPlaylist へキャストして取得する。
+        """
+        try:
+            return playlist.SpecialKind == IT_USER_PLAYLIST_SPECIAL_KIND_FOLDER
+        except AttributeError:
+            try:
+                casted = win32com.client.CastTo(playlist, "IITUserPlaylist")
+                return casted.SpecialKind == IT_USER_PLAYLIST_SPECIAL_KIND_FOLDER
+            except Exception:
+                return False
+        except Exception:
+            return False
+
     def get_playlists(self) -> List[Dict[str, str]]:
-        """利用可能なプレイリストを取得（簡易、名前とID相当のインデックス）"""
+        """利用可能なプレイリストを取得（簡易、名前とID相当のインデックス）。フォルダは除外"""
         if not self.itunes:
             return []
-        
+
         playlists = []
         try:
             sources = self.itunes.Sources
@@ -139,13 +161,15 @@ class WindowsMusicController:
                     playlists_collection = source.Playlists
                     for j in range(1, playlists_collection.Count + 1):
                         playlist = playlists_collection.Item(j)
+                        if self._is_folder_playlist(playlist):
+                            continue
                         playlists.append({
                             'name': playlist.Name,
                             'id': str(j)
                         })
         except Exception as e:
             print(f"プレイリスト取得エラー: {e}")
-        
+
         return playlists
     
     def get_playlist_tracks(self, playlist_name: str) -> List[Dict[str, Any]]:
@@ -633,7 +657,7 @@ class WindowsMusicController:
         return None
 
     def get_all_playlists(self) -> List[str]:
-        """プレイリスト名の一覧を返す（表示用）"""
+        """プレイリスト名の一覧を返す（表示用）。フォルダは除外"""
         names: List[str] = []
         try:
             sources = self.itunes.Sources
@@ -642,28 +666,13 @@ class WindowsMusicController:
                 if source.Kind == 1:
                     playlists = source.Playlists
                     for j in range(1, playlists.Count + 1):
-                        names.append(playlists.Item(j).Name)
+                        playlist = playlists.Item(j)
+                        if self._is_folder_playlist(playlist):
+                            continue
+                        names.append(playlist.Name)
         except Exception as e:
             print(f"プレイリスト一覧取得エラー: {e}")
         return names
-
-    def refresh_playlist(self, playlist_name: str) -> bool:
-        """指定されたプレイリストをリフレッシュ（スマートプレイリストの再構築）"""
-        if not self.itunes:
-            return False
-        try:
-            target = self._find_playlist_by_name(playlist_name)
-            if target is None:
-                return False
-            # スマートプレイリストの場合、Rebuild() で再構築
-            if hasattr(target, 'Rebuild'):
-                target.Rebuild()
-                return True
-            # 通常のプレイリストの場合は何もしない（リフレッシュ不要）
-            return True
-        except Exception as e:
-            print(f"プレイリストリフレッシュエラー: {e}")
-            return False
 
     def get_playlists_of_current_track(self) -> List[str]:
         """現在のトラックが含まれているプレイリスト名一覧を返す。
@@ -810,3 +819,73 @@ class WindowsMusicController:
         except Exception as e:
             print(f"BPM設定エラー: {e}")
         return False
+
+    @staticmethod
+    def get_play_order_mapping_threadsafe(playlist_name: str) -> Dict[int, int]:
+        """指定プレイリストの TrackDatabaseID → PlayOrderIndex マッピングを取得（スレッドセーフ）。
+
+        呼び出し側スレッドで COM を初期化/破棄し、iTunes の現在の表示順を反映した
+        PlayOrderIndex を返す。XML 読み込み後にソート順を iTunes に合わせるために使用。
+        """
+        mapping: Dict[int, int] = {}
+        try:
+            pythoncom.CoInitialize()
+            try:
+                try:
+                    it = WindowsMusicController._create_itunes()
+                except Exception as e:
+                    print(f"PlayOrderIndex取得: iTunes COM接続失敗: {e}")
+                    return mapping
+
+                target = None
+                try:
+                    sources = getattr(it, "Sources", None)
+                    if sources is None:
+                        return mapping
+                    for i in range(1, sources.Count + 1):
+                        src = sources.Item(i)
+                        if getattr(src, "Kind", None) != 1:
+                            continue
+                        pls = getattr(src, "Playlists", None)
+                        if pls is None:
+                            continue
+                        for j in range(1, pls.Count + 1):
+                            pl = pls.Item(j)
+                            if getattr(pl, "Name", None) == playlist_name:
+                                target = pl
+                                break
+                        if target is not None:
+                            break
+                except Exception as e:
+                    print(f"PlayOrderIndex取得: プレイリスト検索エラー: {e}")
+                    return mapping
+
+                if target is None:
+                    return mapping
+
+                tracks_collection = getattr(target, "Tracks", None)
+                if tracks_collection is None:
+                    return mapping
+
+                try:
+                    count = tracks_collection.Count
+                except Exception:
+                    return mapping
+
+                for i in range(1, count + 1):
+                    try:
+                        tr = tracks_collection.Item(i)
+                        dbid = getattr(tr, 'TrackDatabaseID', None)
+                        poi = getattr(tr, 'PlayOrderIndex', None)
+                        if dbid is not None and poi is not None:
+                            mapping[dbid] = poi
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"get_play_order_mapping_threadsafeエラー: {e}")
+        return mapping
