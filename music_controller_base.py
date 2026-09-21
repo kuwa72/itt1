@@ -6,9 +6,7 @@ Cross-platform abstraction for iTunes (Windows) and Music (macOS) control
 import platform
 import subprocess
 import json
-from typing import Dict, List, Set, Any
-import threading
-import time
+from typing import Dict, List, Any
 
 
 def detect_platform() -> str:
@@ -38,13 +36,6 @@ def create_music_controller():
 
 class MacOSMusicController:
     """macOS Music app controller using AppleScript"""
-
-    def __init__(self):
-        self._cache_lock = threading.Lock()
-        self._playlist_cache: Dict[str, tuple[float, Set[int]]] = {}
-        self._cache_ttl_sec: float = 300.0
-        self._recent_sig_cache: Dict[tuple, tuple[float, Set[str]]] = {}
-        self._recent_sig_ttl_sec: float = 300.0
 
     def _run_applescript(self, script: str) -> str:
         """Execute AppleScript and return result"""
@@ -186,41 +177,6 @@ class MacOSMusicController:
         except RuntimeError:
             return False
 
-    # Cache management methods (simplified for macOS)
-    def get_playlists_of_current_track_from_cache(self) -> List[str]:
-        """Get playlists containing current track from cache"""
-        # Basic cache-only check using database_id and recent signatures
-        names: List[str] = []
-        try:
-            info = self.get_current_track_info() or {}
-            dbid = info.get('database_id')
-            sig = (info.get('name','-'), info.get('artist','-'), info.get('album','-'), int(info.get('duration') or 0))
-            with self._cache_lock:
-                ent = self._recent_sig_cache.get(sig)
-                if ent and (time.time() - ent[0]) <= self._recent_sig_ttl_sec:
-                    names.extend([n for n in ent[1] if n not in names])
-                if isinstance(dbid, int):
-                    for pl_name, (ts, dbids) in self._playlist_cache.items():
-                        if (time.time() - ts) <= self._cache_ttl_sec and dbid in dbids:
-                            if pl_name not in names:
-                                names.append(pl_name)
-        except Exception:
-            pass
-        return names
-
-    def is_playlist_cache_fresh(self, playlist_name: str) -> bool:
-        with self._cache_lock:
-            ent = self._playlist_cache.get(playlist_name)
-            if not ent:
-                return False
-            ts, dbids = ent
-            now = time.time()
-            if (now - ts) <= self._cache_ttl_sec:
-                # sliding expiration
-                self._playlist_cache[playlist_name] = (now, set(dbids))
-                return True
-            return False
-
     # The following APIs keep GUI compatibility
     def create_playlist(self, name: str) -> bool:
         script = f'tell application "Music" to make new user playlist with properties {{name:\"{name}\"}}'
@@ -229,41 +185,3 @@ class MacOSMusicController:
             return True
         except Exception:
             return False
-
-    def get_playlist_dbids_threadsafe(self, playlist_name: str, cap: int | None = None, force_refresh: bool = False) -> Set[int]:
-        # Build DBID set for the given playlist and cache it
-        script = f'''
-        tell application "Music"
-            set out_ids to {{}}
-            try
-                set the_pl to user playlist "{playlist_name}"
-                repeat with t in (get tracks of the_pl)
-                    set end of out_ids to (get database ID of t)
-                end repeat
-            end try
-            return out_ids
-        end tell
-        '''
-        try:
-            out = self._run_applescript(script)
-            # AppleScript returns like: {123, 456, 789}
-            raw = out.strip().strip('{}')
-            s: Set[int] = set()
-            if raw:
-                for part in raw.split(','):
-                    p = part.strip()
-                    if p.isdigit():
-                        s.add(int(p))
-            with self._cache_lock:
-                self._playlist_cache[playlist_name] = (time.time(), s)
-            return s
-        except Exception:
-            return set()
-
-    def get_all_playlists_threadsafe(self) -> List[str]:
-        return self.get_all_playlists()
-
-    @staticmethod
-    def get_play_order_mapping_threadsafe(playlist_name: str) -> Dict[int, int]:
-        """macOSでは PlayOrderIndex に相当するAPIがないため空のマッピングを返す。"""
-        return {}
