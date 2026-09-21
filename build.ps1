@@ -53,6 +53,10 @@ if ($ForceReinstall -or (-not (Test-Path $BuildInstalledMarker)) -or (-not (Test
     } else {
         & $VenvPip install -r "$ScriptDir\requirements.txt" -r "$ScriptDir\requirements-windows.txt" pyinstaller
     }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Dependency installation failed (exit code $LASTEXITCODE)."
+        exit 1
+    }
     if (Test-Path "$VenvDir\Scripts\pywin32_postinstall.py") {
         & $VenvPython "$VenvDir\Scripts\pywin32_postinstall.py" -install -quiet | Out-Null
     }
@@ -67,13 +71,22 @@ if ($ForceReinstall -or (-not (Test-Path $BuildInstalledMarker)) -or (-not (Test
 
 # 4. Build exe with PyInstaller
 Write-Host "[itt1] Building executable with PyInstaller..." -ForegroundColor Cyan
+$ExePath = Join-Path $ScriptDir "dist\iTunesController.exe"
+# Remove any stale exe so a failed build cannot be mistaken for success.
+Remove-Item $ExePath -Force -ErrorAction SilentlyContinue
+# Invoke via `python -m PyInstaller`: the pyinstaller.exe trampoline generates
+# \\?\UNC\ prefixed paths that fail to load DLLs in PyInstaller's isolated
+# child processes when the repo lives on a UNC share (e.g. \\wsl.localhost).
 if (Test-Path "$ScriptDir\iTunesController.spec") {
-    & $VenvPyInstaller --noconfirm "$ScriptDir\iTunesController.spec"
+    & $VenvPython -m PyInstaller --noconfirm "$ScriptDir\iTunesController.spec"
 } else {
-    & $VenvPyInstaller --noconfirm --onefile --windowed --name iTunesController main.py
+    & $VenvPython -m PyInstaller --noconfirm --onefile --windowed --name iTunesController main.py
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "PyInstaller failed (exit code $LASTEXITCODE)."
+    exit 1
 }
 
-$ExePath = Join-Path $ScriptDir "dist\iTunesController.exe"
 if (-not (Test-Path $ExePath)) {
     Write-Error "Build failed: $ExePath not found."
     exit 1
