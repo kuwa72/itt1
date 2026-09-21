@@ -6,12 +6,13 @@ from rich.live import Live
 from rich.table import Table
 from rich.align import Align
 import keyboard
+import msvcrt
+import queue
 import threading
 import time
 from typing import List, Dict, Any
 from itunes_controller import iTunesController
 from config import ConfigManager
-import msvcrt
 
 
 class iTunesTUI:
@@ -23,6 +24,9 @@ class iTunesTUI:
         self.config_manager = config_manager or ConfigManager()
         self.use_global_hook = use_global_hook
         self.running = True
+        # キー入力スレッド→メインスレッド(STA)へのイベント受け渡しキュー。
+        # COM 操作はメインスレッドのループでのみ行う（STA違反防止）
+        self._key_event_queue = queue.Queue()
         self.current_track_info = {}
         self.playlists = []
         # ASCII keyboard top 3 rows: number row + QWERTY + ASDF (per-page)
@@ -296,64 +300,95 @@ class iTunesTUI:
         }
         return alias.get(k, k)
     
+    def _on_global_key_press(self, event):
+        """keyboard グローバルフックのコールバック（keyboardライブラリ内部スレッドで実行）。
+
+        COM オブジェクトはメインスレッドの STA で生成されているため、
+        このスレッドから self.itunes に触れてはいけない（STA違反）。
+        ここではキーイベントをキューに積むだけにする。
+        """
+        name = getattr(event, 'name', '')
+        if str(name).lower() in ("ctrl", "left ctrl", "right ctrl"):
+            return False
+        is_ctrl = False
+        try:
+            is_ctrl = keyboard.is_pressed('ctrl')
+        except Exception:
+            is_ctrl = False
+        self._key_event_queue.put((name, is_ctrl))
+        return False  # イベントを消費
+
+    def _local_key_reader(self):
+        """msvcrt フォールバックのポーリングスレッド本体。
+
+        グローバルフックが不安定な環境向け。COM 操作はせず、
+        キーイベントをキューに積むだけにする。
+        """
+        special_map = {
+            'H': 'up',
+            'P': 'down',
+            'K': 'left',
+            'M': 'right',
+        }
+        while self.running:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch == '\x00' or ch == '\xe0':
+                    # 特殊キー（矢印など）
+                    code = msvcrt.getwch()
+                    mapped = special_map.get(code)
+                    if mapped and mapped in self.key_bindings:
+                        self._key_event_queue.put((mapped, False))
+                else:
+                    # 通常キー
+                    if ch == ' ':
+                        keyname = 'space'
+                    else:
+                        keyname = ch.lower()
+                    if keyname in self.key_bindings:
+                        self._key_event_queue.put((keyname, False))
+            time.sleep(0.02)
+
+    def _drain_key_events(self):
+        """キューに溜まったキーイベントを処理する。
+
+        COM 操作を伴う handle_key_press はメインスレッド（=STA）からのみ呼ぶ。
+        """
+        while True:
+            try:
+                key, ctrl = self._key_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.handle_key_press(key, ctrl=ctrl)
+            except Exception:
+                # 1件のハンドラ失敗で残りのイベントやメインループを止めない
+                continue
+
     def run(self):
         """メインループ"""
         self.console.clear()
         self.console.print("[bold green]iTunes Controller 起動中...[/bold green]")
         if str(self.last_action).startswith("XML"):
             self.console.print(f"[cyan]{self.last_action}[/cyan]")
-        
+
         # 初期化
         self.refresh_playlists()
-        
+
         # キーボードフックを設定（必要時のみ）
+        # コールバックは別スレッドで実行されるためキュー投入のみ行う
         if self.use_global_hook:
-            def on_key_press(event):
-                name = getattr(event, 'name', '')
-                if str(name).lower() in ("ctrl", "left ctrl", "right ctrl"):
-                    return False
-                is_ctrl = False
-                try:
-                    is_ctrl = keyboard.is_pressed('ctrl')
-                except Exception:
-                    is_ctrl = False
-                self.handle_key_press(name, ctrl=is_ctrl)
-                return False  # イベントを消費
-            keyboard.on_press(on_key_press)
-        
+            keyboard.on_press(self._on_global_key_press)
+
         # msvcrt フォールバック: グローバルフックが不安定な環境向け
-        def local_key_reader():
-            special_map = {
-                'H': 'up',
-                'P': 'down',
-                'K': 'left',
-                'M': 'right',
-            }
-            while self.running:
-                if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    if ch == '\x00' or ch == '\xe0':
-                        # 特殊キー（矢印など）
-                        code = msvcrt.getwch()
-                        mapped = special_map.get(code)
-                        if mapped and mapped in self.key_bindings:
-                            self.handle_key_press(mapped)
-                    else:
-                        # 通常キー
-                        if ch == ' ':
-                            keyname = 'space'
-                        else:
-                            keyname = ch.lower()
-                        if keyname in self.key_bindings:
-                            self.handle_key_press(keyname)
-                time.sleep(0.02)
-        t = threading.Thread(target=local_key_reader, daemon=True)
+        t = threading.Thread(target=self._local_key_reader, daemon=True)
         t.start()
-        
+
         # メインループ
         try:
             with Live(self.create_layout(), refresh_per_second=4, console=self.console) as live:
                 while self.running:
+                    self._drain_key_events()
                     self.update_track_info()
                     live.update(self.create_layout())
                     time.sleep(0.25)

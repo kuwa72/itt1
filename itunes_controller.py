@@ -321,8 +321,9 @@ class iTunesController:
 
                 # Cache check by signature
                 sig = (cname, cart, calb, cdur)
-                if self._last_result_sig == sig and (time.time() - self._last_result_time) <= 2.0:
-                    return list(self._last_result_names)
+                with self._cache_lock:
+                    if self._last_result_sig == sig and (time.time() - self._last_result_time) <= 2.0:
+                        return list(self._last_result_names)
                 # Consult recent-added cache first
                 recent = self._get_recent_sig_playlists(sig)
                 if recent:
@@ -399,9 +400,10 @@ class iTunesController:
                         except Exception:
                             continue
                 # Save cache
-                self._last_result_sig = sig
-                self._last_result_names = list(result)
-                self._last_result_time = time.time()
+                with self._cache_lock:
+                    self._last_result_sig = sig
+                    self._last_result_names = list(result)
+                    self._last_result_time = time.time()
             finally:
                 try:
                     pythoncom.CoUninitialize()
