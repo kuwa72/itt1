@@ -1317,18 +1317,10 @@ class ITunesTkApp:
         """現在再生中のプレイリストとトラックに移動"""
         try:
             self._manual_playlist_view = False
-            # 現在のプレイリストを取得
-            if not self.ctrl.itunes:
-                return
-            
-            current_playlist = getattr(self.ctrl.itunes, 'CurrentPlaylist', None)
-            if not current_playlist:
-                self.last_action = "再生中のプレイリストがありません"
-                return
-            
-            playlist_name = getattr(current_playlist, 'Name', '')
+            # 現在のプレイリストを取得（プラットフォーム共通API経由）
+            playlist_name = self.ctrl.get_current_playlist_name()
             if not playlist_name:
-                self.last_action = "プレイリスト名を取得できません"
+                self.last_action = "再生中のプレイリストがありません"
                 return
             
             # プレイリスト一覧から該当プレイリストを選択
