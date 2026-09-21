@@ -49,6 +49,14 @@ class WindowsMusicController:
             self.itunes = self._create_itunes()
         except Exception as e:
             raise RuntimeError(f"iTunesに接続できません: {e}")
+
+    def close(self):
+        """終了処理: _connect で CoInitialize した COM を呼び出しスレッドで解放する"""
+        self.itunes = None
+        try:
+            pythoncom.CoUninitialize()
+        except Exception as e:
+            logger.debug("CoUninitialize に失敗: %s", e)
     
     def get_current_track_info(self) -> Dict[str, Any]:
         """現在再生中のトラック情報を取得"""

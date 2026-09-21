@@ -94,6 +94,10 @@ class PlaylistPicker(tk.Toplevel):
 class ITunesTkApp:
     # update_ui_loop 連続失敗時のバックオフ上限（ミリ秒）
     UPDATE_LOOP_MAX_INTERVAL_MS = 30_000
+    # 終了処理中フラグ / モーダルダイアログ表示カウント。
+    # クラス既定値を置き、__init__ 未到達のインスタンスでも on_key 等が安全に参照できるようにする
+    _closing: bool = False
+    _modal_open: int = 0
 
     def __init__(self, root: tk.Tk, config: ConfigManager):
         self.root = root
@@ -170,6 +174,12 @@ class ITunesTkApp:
         self._playlist_click_after_id = None
         # ダブルクリック/Enterで再生した時刻（直後のButtonRelease由来の遅延実行を捨てるため）
         self._last_playlist_play_at: float = 0.0
+        # 終了処理中フラグ（Trueの間は after の再スケジュールとグローバルホットキーを停止）
+        self._closing = False
+        # モーダルダイアログ表示中のカウント（>0 の間はグローバルホットキーを抑制）
+        self._modal_open = 0
+        # _after 経由で登録した after ID（終了時に一括 after_cancel する）
+        self._pending_after_ids: set = set()
 
         # 曲変更検知用
         self._synced_dbid: int | None = None
@@ -184,11 +194,14 @@ class ITunesTkApp:
         # Key binds (window focused)
         self.bind_keys()
 
+        # ウィンドウを閉じる操作を終了処理に接続
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
         # Start update loop
         self.update_ui_loop()
 
         # 起動直後にiTunesの再生状態をUIに反映
-        self.root.after(300, self._sync_to_itunes_state)
+        self._after(300, self._sync_to_itunes_state)
 
     def build_ui(self):
         # メニューバー
@@ -405,6 +418,91 @@ class ITunesTkApp:
     def bind_keys(self):
         self.root.bind_all("<KeyPress>", self.on_key)
 
+    def _after(self, ms: int, func, *args):
+        """root.after のラッパー。返された ID を _pending_after_ids に記録し、
+        終了時に一括 after_cancel できるようにする。
+        発火済みの ID は残るが、after_cancel 側の失敗は無視するため問題ない。"""
+        try:
+            after_id = self.root.after(ms, func, *args)
+        except Exception:
+            return None
+        try:
+            ids = getattr(self, "_pending_after_ids", None)
+            if ids is None:
+                ids = self._pending_after_ids = set()
+            ids.add(after_id)
+        except Exception:
+            pass
+        return after_id
+
+    def _begin_modal(self):
+        self._modal_open = getattr(self, "_modal_open", 0) + 1
+
+    def _end_modal(self):
+        self._modal_open = max(0, getattr(self, "_modal_open", 0) - 1)
+
+    def _show_error(self, message: str):
+        """モーダルなエラーダイアログ。表示中はグローバルホットキーを抑制する"""
+        self._begin_modal()
+        try:
+            messagebox.showerror("エラー", message)
+        except Exception:
+            pass
+        finally:
+            self._end_modal()
+
+    def on_closing(self):
+        """終了処理。WM_DELETE_WINDOW と 'm' キーの両方から呼ばれる。
+
+        実行中ワーカーへのキャンセル通知 → 短い待機 → 登録済み after のキャンセル
+        → COM 解放 → root.destroy の順でクリーンアップする。
+        """
+        if self._closing:
+            return
+        self._closing = True
+
+        # 実行中のトラック読み込みワーカーにキャンセルを通知
+        try:
+            cancel_event = getattr(self, "_track_loading_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
+        except Exception:
+            pass
+
+        # daemon ワーカーが cancel を検知して終了処理を回るまで短く待つ（UIを長く止めない）
+        try:
+            worker = getattr(self, "_track_loading_thread", None)
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=0.3)
+        except Exception:
+            pass
+
+        # 管理下の after コールバックをすべてキャンセル（destroy 後の発火/TclError を防ぐ）
+        cancel_ids = list(getattr(self, "_pending_after_ids", None) or ())
+        click_after_id = getattr(self, "_playlist_click_after_id", None)
+        if click_after_id is not None:
+            cancel_ids.append(click_after_id)
+        for after_id in cancel_ids:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._pending_after_ids = set()
+        self._playlist_click_after_id = None
+
+        # メインスレッドで CoInitialize 済みの COM を解放（コントローラーが対応していれば）
+        try:
+            close = getattr(self.ctrl, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def toggle_help(self):
         """ヘルプ表示のトグル"""
         if self.help_visible.get():
@@ -453,6 +551,10 @@ class ITunesTkApp:
 
     def on_key(self, event: tk.Event):
         try:
+            # 終了処理中・モーダルダイアログ表示中はグローバルホットキーを抑制
+            if self._closing or getattr(self, "_modal_open", 0):
+                return
+
             # 入力ボックス（Entry/Text）にフォーカスがある場合はホットキーを無効化
             focus = self.root.focus_get()
             if focus is not None and isinstance(focus, (tk.Entry, tk.Text, ttk.Entry, tk.Spinbox)):
@@ -495,7 +597,7 @@ class ITunesTkApp:
             if k == "x":
                 self.reset_bpm(); return "break"
             if k == "m":
-                self.root.destroy(); return "break"
+                self.on_closing(); return "break"
             if k == "g" and (event.state & 0x4):  # Ctrl+G
                 self.goto_current_track(); return "break"
         except Exception as e:
@@ -556,19 +658,24 @@ class ITunesTkApp:
             lbl.configure(bg=bg, fg=fg)
         except Exception:
             return
-        self.root.after(300, lambda: self.update_slot_labels())
+        self._after(300, self.update_slot_labels)
 
     def pick_slots(self):
         names = self.ctrl.get_all_playlists()
         if not names:
-            messagebox.showerror("エラー", "プレイリスト一覧を取得できませんでした")
+            self._show_error("プレイリスト一覧を取得できませんでした")
             return
         folder_map = self._get_playlist_folder_map()
         labels = [self._playlist_display_label(n, folder_map) for n in names]
         label_to_raw = dict(zip(labels, names))
         preselected_labels = [self._playlist_display_label(n, folder_map) for n in self.quick_slots]
-        dlg = PlaylistPicker(self.root, labels, preselected=preselected_labels, max_select=len(names))
-        self.root.wait_window(dlg)
+        # モーダル表示中はグローバルホットキーを抑制するためフラグを立てる
+        self._begin_modal()
+        try:
+            dlg = PlaylistPicker(self.root, labels, preselected=preselected_labels, max_select=len(names))
+            self.root.wait_window(dlg)
+        finally:
+            self._end_modal()
         if dlg.result is None:
             return
         self.quick_slots = [label_to_raw[label] for label in dlg.result]
@@ -579,7 +686,12 @@ class ITunesTkApp:
 
     def create_single_playlist(self):
         from tkinter import simpledialog
-        name = simpledialog.askstring("新規プレイリスト", "作成するプレイリスト名を入力:", parent=self.root)
+        # モーダル表示中はグローバルホットキーを抑制するためフラグを立てる
+        self._begin_modal()
+        try:
+            name = simpledialog.askstring("新規プレイリスト", "作成するプレイリスト名を入力:", parent=self.root)
+        finally:
+            self._end_modal()
         if not name:
             self.last_action = "プレイリスト作成キャンセル"
             return
@@ -655,13 +767,15 @@ class ITunesTkApp:
         try:
             if self._playlist_click_after_id is not None:
                 self.root.after_cancel(self._playlist_click_after_id)
-            self._playlist_click_after_id = self.root.after(250, self._show_selected_playlist_tracks)
+            self._playlist_click_after_id = self._after(250, self._show_selected_playlist_tracks)
         except Exception:
             pass
 
     def _show_selected_playlist_tracks(self):
         """選択中プレイリストのトラック一覧を表示（再生は行わない）"""
         self._playlist_click_after_id = None
+        if self._closing:
+            return
         # ダブルクリック/Enter直後のButtonRelease由来の遅延実行は捨てる
         if time.monotonic() - self._last_playlist_play_at < 0.5:
             return
@@ -778,10 +892,7 @@ class ITunesTkApp:
 
         if not self._library_xml_exists:
             self.last_action = "XML未設定/未検出のためトラック一覧を取得できません"
-            try:
-                messagebox.showerror("エラー", "ライブラリXMLが見つからないためトラック一覧を取得できません")
-            except Exception:
-                pass
+            self._show_error("ライブラリXMLが見つからないためトラック一覧を取得できません")
             return
 
         ok = False
@@ -791,20 +902,14 @@ class ITunesTkApp:
             ok = False
         if not ok:
             self.last_action = "XML読込失敗"
-            try:
-                messagebox.showerror("エラー", "ライブラリXMLの読み込みに失敗しました")
-            except Exception:
-                pass
+            self._show_error("ライブラリXMLの読み込みに失敗しました")
             return
 
         with self._library_xml_lock:
             pls = self._library_xml_playlists or []
         if not any((p.get('Name') == playlist_name) for p in pls if isinstance(p, dict)):
             self.last_action = f"XMLにプレイリストがありません: {playlist_name}"
-            try:
-                messagebox.showerror("エラー", f"XMLにプレイリストがありません: {playlist_name}")
-            except Exception:
-                pass
+            self._show_error(f"XMLにプレイリストがありません: {playlist_name}")
             return
 
         self._track_loading_thread = threading.Thread(
@@ -819,8 +924,8 @@ class ITunesTkApp:
 
     def _poll_track_queue(self, generation: int):
         """バックグラウンドワーカーから届いたトラックバッチをUIに反映"""
-        # 自分の世代ではなくなったポーラーは即終了（新キューを読まない・再スケジュールしない）
-        if generation != self._track_load_generation:
+        # 終了処理中、または自分の世代ではなくなったポーラーは即終了（新キューを読まない・再スケジュールしない）
+        if self._closing or generation != self._track_load_generation:
             return
 
         q = self._track_loading_queue
@@ -847,7 +952,7 @@ class ITunesTkApp:
             and not cancel_event.is_set()
         )
         if worker_alive or (not q.empty()):
-            self.root.after(30, self._poll_track_queue, generation)
+            self._after(30, self._poll_track_queue, generation)
         else:
             # ワーカー完了: 保存されたdbidでトラックをハイライト
             if self._track_loading_dbid is not None:
@@ -1258,6 +1363,8 @@ class ITunesTkApp:
 
     def _sync_to_itunes_state(self):
         """iTunesの現在の再生状態をUIに反映する（起動直後用）"""
+        if self._closing:
+            return
         try:
             info = self.ctrl.get_current_track_info()
             if not info:
@@ -1328,6 +1435,9 @@ class ITunesTkApp:
             pass
 
     def update_ui_loop(self):
+        # 終了処理中は更新も再スケジュールも行わずループを終了する
+        if self._closing:
+            return
         try:
             base_interval = int(self.config.config.refresh_interval * 1000)
         except Exception:
@@ -1379,11 +1489,9 @@ class ITunesTkApp:
                 self.UPDATE_LOOP_MAX_INTERVAL_MS,
             )
         finally:
-            try:
-                self.root.after(next_interval, self.update_ui_loop)
-            except Exception:
-                # root 破棄後など再スケジュール自体が失敗した場合はループ終了
-                logger.debug("update_ui_loop の再スケジュールに失敗", exc_info=True)
+            # 終了処理中は再スケジュールしない（ループ終了）
+            if not self._closing:
+                self._after(next_interval, self.update_ui_loop)
 
     # BPM helpers
     def tap_bpm(self):
