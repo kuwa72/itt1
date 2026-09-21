@@ -6,6 +6,7 @@ update_ui_loop / on_key を直接呼び出す。
 """
 
 import logging
+import queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +38,9 @@ def _make_app() -> ITunesTkApp:
     app._seeking = False
     app._synced_dbid = None
     app._synced_playlist = None
+    # Issue #5: update_ui_loop はCOMを直接呼ばず _ui_queue を drain する
+    app._ui_queue = queue.Queue()
+    app._latest_track_info = None
     app.slot_bank = 0
     app.slot_keys = list("1234567890-=") + list("qwertyuiop[]\\") + list("asdfghjkl;'")
     app.bank_size = len(app.slot_keys)
@@ -59,9 +63,10 @@ def test_update_ui_loop_reschedules_on_success():
 
 
 def test_update_ui_loop_reschedules_after_controller_error():
-    """get_current_track_info が例外を投げてもループが再スケジュールされる"""
+    """ポーリング結果適用中の例外でもループが再スケジュールされる"""
     app = _make_app()
-    app.ctrl.get_current_track_info.side_effect = RuntimeError("COM error")
+    app._apply_track_info = MagicMock(side_effect=RuntimeError("apply error"))
+    app._ui_queue.put(("track_info", {"dbid": 1}))
     app.update_ui_loop()  # 例外が外へ漏れないこと
     app.root.after.assert_called_once()
     assert app.root.after.call_args[0][1] == app.update_ui_loop
@@ -70,10 +75,10 @@ def test_update_ui_loop_reschedules_after_controller_error():
 def test_update_ui_loop_reschedules_after_widget_error():
     """途中の widget 更新で例外が発生しても再スケジュールされる"""
     app = _make_app()
-    app.ctrl.get_current_track_info.return_value = {
+    app._ui_queue.put(("track_info", {
         "is_playing": True, "name": "n", "artist": "a", "album": "al",
         "position": 10, "duration": 100, "dbid": 1, "playlist": "p",
-    }
+    }))
     app._on_track_changed = MagicMock(side_effect=RuntimeError("widget error"))
     app.update_ui_loop()
     app.root.after.assert_called_once()
@@ -82,7 +87,7 @@ def test_update_ui_loop_reschedules_after_widget_error():
 def test_update_ui_loop_backoff_on_consecutive_errors():
     """連続失敗時は再スケジュール間隔が伸び、上限を超えない"""
     app = _make_app()
-    app.ctrl.get_current_track_info.side_effect = RuntimeError("COM error")
+    app.last_action_label.configure.side_effect = RuntimeError("UI error")
 
     app.update_ui_loop()
     first = app.root.after.call_args[0][0]
@@ -97,14 +102,13 @@ def test_update_ui_loop_backoff_on_consecutive_errors():
 
 def test_update_ui_loop_backoff_resets_after_success():
     app = _make_app()
-    app.ctrl.get_current_track_info.side_effect = RuntimeError("COM error")
+    app.last_action_label.configure.side_effect = RuntimeError("UI error")
     app.update_ui_loop()
     app.update_ui_loop()
     backed_off = app.root.after.call_args[0][0]
     assert backed_off > 500
 
-    app.ctrl.get_current_track_info.side_effect = None
-    app.ctrl.get_current_track_info.return_value = {}
+    app.last_action_label.configure.side_effect = None
     app.update_ui_loop()
     assert app.root.after.call_args[0][0] == 500
 
