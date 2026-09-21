@@ -84,6 +84,12 @@ def _make_app() -> ITunesTkApp:
     # シークデバウンス
     app._seek_pending_value = None
     app._seek_after_id = None
+    # 音量スライダー（Issue #25）
+    app.volume_scale = MagicMock(name="volume_scale")
+    app.volume_label = MagicMock(name="volume_label")
+    app._volume_seeking = False
+    app._volume_pending_value = None
+    app._volume_after_id = None
     return app
 
 
@@ -361,6 +367,7 @@ def test_com_worker_polls_track_info_and_stops_cleanly():
     app = _make_app()
     worker_ctrl = MagicMock(name="worker_ctrl")
     worker_ctrl.get_current_track_info.return_value = {"dbid": 7}
+    worker_ctrl.get_volume.return_value = 60  # Issue #25: 音量もポーリングに同梱
     app.ctrl.create_worker_controller.return_value = worker_ctrl
 
     def get_then_stop(timeout=None):
@@ -373,7 +380,7 @@ def test_com_worker_polls_track_info_and_stops_cleanly():
 
     app.ctrl.create_worker_controller.assert_called_once()
     worker_ctrl.get_current_track_info.assert_called_once()
-    assert app._ui_queue.get_nowait() == ("track_info", {"dbid": 7})
+    assert app._ui_queue.get_nowait() == ("track_info", {"dbid": 7, "volume": 60})
     # ワーカー専用接続は使い終わったら close される
     worker_ctrl.close.assert_called_once()
 

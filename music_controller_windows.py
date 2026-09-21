@@ -306,7 +306,28 @@ class WindowsMusicController:
             self.itunes.PlayerPosition = max(0, position)
         except Exception:
             pass
-    
+
+    def get_volume(self) -> int | None:
+        """現在の音量 (0-100) を返す。取得失敗時は None"""
+        if not self.itunes:
+            return None
+        try:
+            return int(self.itunes.SoundVolume)
+        except Exception as e:
+            logger.error("音量取得エラー: %s", e)
+            return None
+
+    def set_volume(self, level: int) -> bool:
+        """音量 (0-100) を設定する。範囲外はクリップ、失敗時は False"""
+        if not self.itunes:
+            return False
+        try:
+            self.itunes.SoundVolume = max(0, min(100, int(level)))
+            return True
+        except Exception as e:
+            logger.error("音量設定エラー: %s", e)
+            return False
+
     @staticmethod
     def _is_folder_playlist(playlist: Any) -> bool:
         """フォルダプレイリストかどうかを SpecialKind で判定する。

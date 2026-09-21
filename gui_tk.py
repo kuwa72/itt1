@@ -219,6 +219,10 @@ class ITunesTkApp:
         # シークバーのデバウンス管理（ドラッグ中のモーションイベントを1回のシークにまとめる）
         self._seek_pending_value: float | None = None
         self._seek_after_id = None
+        # 音量スライダーのドラッグ中フラグとデバウンス管理（シークバーと同じパターン）
+        self._volume_seeking = False
+        self._volume_pending_value: float | None = None
+        self._volume_after_id = None
 
         # COMワーカー起動（トラック情報ポーリングとCOMタスク実行を1スレッドに集約）
         self._start_com_worker()
@@ -305,6 +309,37 @@ class ITunesTkApp:
         self.progress_bar.bind("<ButtonPress-1>", self._on_progress_press)
         self.progress_bar.bind("<B1-Motion>", self._on_progress_drag)
         self.progress_bar.bind("<ButtonRelease-1>", self._on_progress_release)
+
+        # 再生コントロール（前/再生/次ボタン + 音量スライダー）
+        controls_row = ttk.Frame(track_frame)
+        controls_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+        controls_row.columnconfigure(4, weight=1)
+
+        ttk.Button(
+            controls_row, text="⏮ 前", command=self.prev_track,
+            width=8, takefocus=False,
+        ).grid(row=0, column=0)
+        ttk.Button(
+            controls_row, text="⏯ 再生", command=self.toggle_play_pause,
+            width=8, takefocus=False,
+        ).grid(row=0, column=1, padx=(4, 0))
+        ttk.Button(
+            controls_row, text="⏭ 次", command=self.next_track,
+            width=8, takefocus=False,
+        ).grid(row=0, column=2, padx=(4, 0))
+
+        self.volume_label = ttk.Label(controls_row, text="音量: -", width=8)
+        self.volume_label.grid(row=0, column=3, padx=(16, 4))
+        self.volume_scale = ttk.Scale(
+            controls_row, from_=0, to=100, orient=tk.HORIZONTAL,
+            command=self.on_volume_change, takefocus=False,
+        )
+        self.volume_scale.grid(row=0, column=4, sticky="ew")
+        # シークバーと同じくトラフクリック/B1-Motion を自前ハンドラで潰し、
+        # event.x の割合へジャンプさせる（デバウンス経路は on_volume_change）
+        self.volume_scale.bind("<ButtonPress-1>", self._on_volume_press)
+        self.volume_scale.bind("<B1-Motion>", self._on_volume_drag)
+        self.volume_scale.bind("<ButtonRelease-1>", self._on_volume_release)
 
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
@@ -558,12 +593,25 @@ class ITunesTkApp:
                         pass
 
     def _poll_track_info(self, ctrl):
-        """ワーカースレッド側: トラック情報を取得してUIキューへ積む"""
+        """ワーカースレッド側: トラック情報と音量を取得してUIキューへ積む"""
         try:
             info = ctrl.get_current_track_info()
         except Exception as e:
             logger.error("トラック情報ポーリングエラー: %s", e)
             info = None
+        # 音量はトラック情報と同じポーリングに同梱する（結果dictの volume キー）。
+        # get_volume を持たないコントローラーや取得失敗時は None のまま送る
+        try:
+            get_volume = getattr(ctrl, "get_volume", None)
+            volume = get_volume() if callable(get_volume) else None
+        except Exception as e:
+            logger.error("音量ポーリングエラー: %s", e)
+            volume = None
+        if isinstance(info, dict):
+            info = dict(info)
+            info["volume"] = volume
+        elif volume is not None:
+            info = {"volume": volume}
         self._ui_put("track_info", info)
 
     def _execute_com_task(self, ctrl, task):
@@ -706,6 +754,16 @@ class ITunesTkApp:
         """ポーリング済みのトラック情報をウィジェットへ反映（UIスレッド。COM不使用）"""
         if not info:
             return
+        # 音量はポーリング値へ追従するが、ドラッグ中はユーザー操作を優先して上書きしない
+        # （_seeking と同じガードパターン）
+        volume = info.get('volume')
+        if volume is not None and not getattr(self, "_volume_seeking", False):
+            try:
+                level = max(0, min(100, int(round(float(volume)))))
+                self.volume_scale.set(level)
+                self.volume_label.configure(text=f"音量: {level}")
+            except Exception:
+                pass
         playing = info.get('is_playing', False)
         self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
         self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
@@ -916,7 +974,12 @@ class ITunesTkApp:
 
     # Actions
     def toggle_play_pause(self):
-        self.ctrl.play_pause()
+        # PlayPause は軽いCOM呼出しだが、UIスレッドでのCOM実行を避ける方針(#5)に
+        # 合わせて next_track/prev_track と同じくCOMワーカーへ委譲する
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit("play_pause")
+        else:
+            self.ctrl.play_pause()
         self._log_action("再生/一時停止")
 
     def skip_forward(self):
@@ -1804,7 +1867,84 @@ class ITunesTkApp:
         except Exception:
             return
         self._com_submit("set_player_position", position)
-    
+
+    # --- 音量スライダー（シークバーと同じパターン） ---
+
+    def _on_volume_press(self, event):
+        """音量スライダー上の Button-1。デフォルトのページ移動を抑制し、
+        クリック位置 (event.x / バー幅) の割合へジャンプする。"""
+        self._volume_seeking = True
+        self._volume_to_event_x(event)
+        return "break"
+
+    def _on_volume_drag(self, event):
+        """B1-Motion 中もクリック位置基準で追従（デバウンス済み音量設定）"""
+        self._volume_to_event_x(event)
+        return "break"
+
+    def _on_volume_release(self, event):
+        """ボタン解放でドラッグ中フラグを落とす（ポーリングへの追従を再開）"""
+        self._volume_seeking = False
+
+    def _volume_to_event_x(self, event):
+        """event.x の割合 (0.0-1.0 にクリップ) に相当する値へスライダーを動かし、
+        on_volume_change 経由でデバウンスされた set_volume を発行する。"""
+        try:
+            width = int(self.volume_scale.winfo_width())
+        except Exception:
+            width = 0
+        if width <= 0:
+            return
+        try:
+            ratio = float(event.x) / width
+        except Exception:
+            return
+        value = max(0.0, min(1.0, ratio)) * 100.0
+        try:
+            self.volume_scale.set(value)
+        except Exception:
+            pass
+        self.on_volume_change(value)
+
+    def on_volume_change(self, value):
+        """音量スライダー変更時。
+
+        ドラッグ中のモーションイベントごとにCOM呼出しをしないよう、
+        after でデバウンスしてからCOMワーカー経由で set_volume を実行する。
+        """
+        if not getattr(self, "_volume_seeking", False):
+            return
+        self._volume_pending_value = value
+        # ドラッグ中はポーリング反映を待たず現在値ラベルを即時更新する
+        try:
+            self.volume_label.configure(
+                text=f"音量: {max(0, min(100, int(round(float(value)))))}"
+            )
+        except Exception:
+            pass
+        old_id = getattr(self, "_volume_after_id", None)
+        if old_id is not None:
+            try:
+                self.root.after_cancel(old_id)
+            except Exception:
+                pass
+        self._volume_after_id = self._after(self.SEEK_DEBOUNCE_MS, self._flush_pending_volume)
+
+    def _flush_pending_volume(self):
+        """デバウンス済み音量変更をCOMワーカーへ投入（発火済みコールバックの二重実行は無害）"""
+        self._volume_after_id = None
+        if self._closing:
+            return
+        value = getattr(self, "_volume_pending_value", None)
+        self._volume_pending_value = None
+        if value is None:
+            return
+        try:
+            level = max(0, min(100, int(round(float(value)))))
+        except Exception:
+            return
+        self._com_submit("set_volume", level)
+
     # トグルメソッド
     def toggle_progress(self):
         if self.show_progress.get():
