@@ -214,7 +214,8 @@ def test_on_key_suppressed_while_closing():
 def test_pick_slots_holds_modal_flag_during_wait_window():
     """PlaylistPicker の wait_window 中に _modal_open が立っている"""
     app = _make_app()
-    app.ctrl.get_all_playlists.return_value = ["PL-A", "PL-B"]
+    # Issue #5: pick_slots は get_all_playlists ではなく _playlist_raw_names キャッシュを使う
+    app._playlist_raw_names = ["PL-A", "PL-B"]
     app._get_playlist_folder_map = lambda: {}
     app.quick_slots = []
 
@@ -239,7 +240,7 @@ def test_pick_slots_holds_modal_flag_during_wait_window():
 def test_modal_flag_released_on_dialog_exception():
     """ダイアログが例外で閉じた場合でも _modal_open が解除される"""
     app = _make_app()
-    app.ctrl.get_all_playlists.return_value = ["PL-A"]
+    app._playlist_raw_names = ["PL-A"]
     app._get_playlist_folder_map = lambda: {}
     app.quick_slots = []
     app.root.wait_window.side_effect = RuntimeError("dialog crashed")

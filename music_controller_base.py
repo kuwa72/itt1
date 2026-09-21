@@ -180,6 +180,11 @@ class MacOSMusicController:
         except RuntimeError:
             return None
 
+    def create_worker_controller(self) -> "MacOSMusicController":
+        """ワーカースレッド用コントローラー。AppleScript(subprocess)ベースで
+        スレッド間共有に問題がないため自身を返す（close 不要）。"""
+        return self
+
     def set_current_track_bpm(self, bpm: int) -> bool:
         """Set BPM for current track"""
         script = f'tell application "Music" to set bpm of current track to {bpm}'

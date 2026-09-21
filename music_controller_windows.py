@@ -57,6 +57,16 @@ class WindowsMusicController:
             pythoncom.CoUninitialize()
         except Exception as e:
             logger.debug("CoUninitialize に失敗: %s", e)
+
+    def create_worker_controller(self) -> "WindowsMusicController":
+        """ワーカースレッド専用の新規コントローラーを返す。
+
+        STA で Dispatch した COM オブジェクトは生成したスレッドでのみ有効なため、
+        このファクトリは利用するワーカースレッド内で呼び出すこと
+        （そのスレッドで CoInitialize + Dispatch が行われる）。
+        使い終わったら同じスレッドで close() して CoUninitialize する。
+        """
+        return WindowsMusicController()
     
     def get_current_track_info(self) -> Dict[str, Any]:
         """現在再生中のトラック情報を取得"""

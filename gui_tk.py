@@ -13,6 +13,12 @@ from config import ConfigManager
 
 logger = logging.getLogger(__name__)
 
+# COMワーカーのタスクキューへ入れる停止トークン（get のタイムアウト待ちを即時解除するため）
+_COM_STOP = object()
+
+# トラック読み込みワーカーがエラーをUIへ伝えるためのバッチ内センチネルキー
+XML_ERROR_KEY = "__xml_error__"
+
 
 class PlaylistPicker(tk.Toplevel):
     def __init__(self, master, all_names: List[str], preselected: List[str] | None = None, max_select: int = 18):
@@ -95,6 +101,9 @@ class PlaylistPicker(tk.Toplevel):
 class ITunesTkApp:
     # update_ui_loop 連続失敗時のバックオフ上限（ミリ秒）
     UPDATE_LOOP_MAX_INTERVAL_MS = 30_000
+    # シークバードラッグのデバウンス間隔（ミリ秒）。モーションごとの同期COMを避け、
+    # ドラッグが止まってから1回だけシークを実行する
+    SEEK_DEBOUNCE_MS = 150
     # 終了処理中フラグ / モーダルダイアログ表示カウント。
     # クラス既定値を置き、__init__ 未到達のインスタンスでも on_key 等が安全に参照できるようにする
     _closing: bool = False
@@ -143,6 +152,8 @@ class ITunesTkApp:
         self._library_xml_tracks: dict[str, dict] | None = None
         self._library_xml_playlists: list[dict] | None = None
         self._library_xml_lock = threading.Lock()
+        # ライブラリXMLのバックグラウンド読込スレッド（plistlib.load をUIスレッドで行わない）
+        self._library_xml_loader_thread: threading.Thread | None = None
         # プレイリスト一覧の表示ラベルに対応する実プレイリスト名（リストボックスのインデックスと対応）
         self._playlist_raw_names: List[str] = []
         self.tap_times: List[float] = []
@@ -188,6 +199,23 @@ class ITunesTkApp:
 
         # update_ui_loop の連続失敗カウンタ（バックオフ用）
         self._update_loop_failures = 0
+
+        # COMワーカー: UIスレッドをブロックする同期COM呼出しを専用スレッドに集約する。
+        # ワーカー → UI への結果反映は _ui_queue 経由で update_ui_loop が drain する。
+        self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._com_task_queue: "queue.Queue" = queue.Queue()
+        self._com_worker_stop = threading.Event()
+        self._com_worker_thread: threading.Thread | None = None
+        # ポーリングで得た最新のトラック情報（UI側はCOMを直接呼ばずこれを参照）
+        self._latest_track_info: dict | None = None
+        # シークバーのデバウンス管理（ドラッグ中のモーションイベントを1回のシークにまとめる）
+        self._seek_pending_value: float | None = None
+        self._seek_after_id = None
+
+        # COMワーカー起動（トラック情報ポーリングとCOMタスク実行を1スレッドに集約）
+        self._start_com_worker()
+        # ライブラリXMLをバックグラウンドで先読み（起動直後の操作を速くする）
+        self._ensure_library_xml_load_started()
 
         # UI
         self.build_ui()
@@ -452,6 +480,202 @@ class ITunesTkApp:
         finally:
             self._end_modal()
 
+    # --- COMワーカー / UIキュー ---
+    # UIスレッドをブロックする同期COM呼出しは専用ワーカースレッドに集約する。
+    # STA で生成した COM オブジェクトは他スレッドから呼べないため、ワーカーは
+    # ctrl.create_worker_controller() で自分専用の接続を持つ。
+    # ワーカー → UI への反映は _ui_queue に積み、update_ui_loop が drain する
+    # （Tk にはUIスレッドからのみ触れる原則を維持）。
+
+    def _start_com_worker(self):
+        """COMワーカースレッドを起動（多重起動防止）"""
+        if getattr(self, "_com_task_queue", None) is None:
+            return
+        t = getattr(self, "_com_worker_thread", None)
+        if t is not None and t.is_alive():
+            return
+        try:
+            t = threading.Thread(
+                target=self._com_worker_loop, daemon=True, name="itunes-com-worker"
+            )
+            self._com_worker_thread = t
+            t.start()
+        except Exception as e:
+            logger.error("COMワーカー起動失敗: %s", e)
+            self._com_worker_thread = None
+
+    def _com_worker_loop(self):
+        """COM操作専用ループ。タスク実行とトラック情報ポーリングを行う。
+
+        - タスクキューに (fn, args, kwargs, result_tag) が来れば実行。
+          fn が文字列ならワーカー用コントローラーのメソッド名として解決する。
+        - タイムアウト（refresh_interval 経過）時は get_current_track_info を
+          ポーリングして ("track_info", info) を _ui_queue へ積む。
+        - result_tag があれば ("task_result", tag, result) を _ui_queue へ積む。
+        """
+        ctrl = self.ctrl
+        try:
+            factory = getattr(self.ctrl, "create_worker_controller", None)
+            if callable(factory):
+                ctrl = factory()
+        except Exception as e:
+            logger.error("COMワーカー用コントローラー生成失敗: %s", e)
+            ctrl = self.ctrl
+        try:
+            while not self._com_worker_stop.is_set() and not getattr(self, "_closing", False):
+                try:
+                    interval = float(self.config.config.refresh_interval)
+                except Exception:
+                    interval = 0.5
+                interval = max(0.1, interval)
+                try:
+                    task = self._com_task_queue.get(timeout=interval)
+                except queue.Empty:
+                    task = None
+                try:
+                    if task is _COM_STOP:
+                        break
+                    if task is None:
+                        self._poll_track_info(ctrl)
+                    else:
+                        self._execute_com_task(ctrl, task)
+                except Exception as e:
+                    logger.error("COMワーカー処理エラー: %s", e)
+        finally:
+            # ワーカー専用接続（別スレッドで CoInitialize した COM）はここで解放
+            if ctrl is not self.ctrl:
+                close = getattr(ctrl, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+    def _poll_track_info(self, ctrl):
+        """ワーカースレッド側: トラック情報を取得してUIキューへ積む"""
+        try:
+            info = ctrl.get_current_track_info()
+        except Exception as e:
+            logger.error("トラック情報ポーリングエラー: %s", e)
+            info = None
+        self._ui_put("track_info", info)
+
+    def _execute_com_task(self, ctrl, task):
+        """ワーカースレッド側: COMタスクを1件実行し、必要なら結果をUIキューへ返す"""
+        fn, args, kwargs, result_tag = task
+        try:
+            target = getattr(ctrl, fn) if isinstance(fn, str) else fn
+            result = target(*args, **kwargs)
+        except Exception as e:
+            logger.error("COMタスク実行エラー: %s", e)
+            return
+        if result_tag is not None:
+            self._ui_put("task_result", result_tag, result)
+
+    def _com_submit(self, fn, *args, _result_tag=None, **kwargs):
+        """COMワーカーにタスクを投入する。UIスレッドはブロックしない。
+
+        fn: コントローラーのメソッド名(str)、または呼び出し可能オブジェクト。
+        _result_tag: 結果を _ui_queue へ返すときの識別タグ。
+        """
+        if getattr(self, "_closing", False):
+            return
+        q = getattr(self, "_com_task_queue", None)
+        if q is None:
+            return
+        try:
+            q.put((fn, args, kwargs, _result_tag))
+        except Exception:
+            pass
+
+    def _ui_put(self, *msg):
+        """ワーカー → UI へのメッセージ投入（UIキューが無ければ捨てる）"""
+        q = getattr(self, "_ui_queue", None)
+        if q is None:
+            return
+        try:
+            q.put(msg)
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        """UIスレッド側: ワーカーからのメッセージを処理する。
+        1ティックで処理する件数を制限してUIスレッドを占有しすぎない。"""
+        q = getattr(self, "_ui_queue", None)
+        if q is None:
+            return
+        info_seen = False
+        latest_info = None
+        processed = 0
+        while processed < 20:
+            try:
+                msg = q.get_nowait()
+            except queue.Empty:
+                break
+            processed += 1
+            try:
+                kind = msg[0]
+                if kind == "track_info":
+                    info_seen = True
+                    latest_info = msg[1]
+                elif kind == "task_result":
+                    self._handle_task_result(msg[1], msg[2])
+                elif kind == "library_xml_loaded":
+                    self._on_library_xml_loaded(msg[1])
+            except Exception as e:
+                logger.error("UIキュー処理エラー: %s", e)
+        if info_seen:
+            self._latest_track_info = latest_info or {}
+            self._apply_track_info(self._latest_track_info)
+
+    def _handle_task_result(self, tag, result):
+        """COMタスクの結果をUIへ反映（UIスレッド）"""
+        try:
+            if tag == "playlists":
+                self._apply_playlist_list(result or [])
+                return
+            if isinstance(tag, tuple) and tag:
+                kind = tag[0]
+                name = tag[1] if len(tag) > 1 else None
+                if kind == "play_track":
+                    self.last_action = (
+                        f"トラック再生: {name or '-'}" if result else "トラック再生失敗"
+                    )
+                elif kind == "play_playlist" and not result:
+                    self.last_action = f"プレイリスト再生失敗: {name or '-'}"
+        except Exception as e:
+            logger.error("タスク結果処理エラー: %s", e)
+
+    def _apply_track_info(self, info):
+        """ポーリング済みのトラック情報をウィジェットへ反映（UIスレッド。COM不使用）"""
+        if not info:
+            return
+        playing = info.get('is_playing', False)
+        self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
+        self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
+        self.track_artist.configure(text=f"アーティスト: {info.get('artist', '-')}")
+        self.track_album.configure(text=f"アルバム: {info.get('album', '-')}")
+        pos = int(info.get('position', 0) or 0)
+        dur = int(info.get('duration', 0) or 0)
+        pm, ps = divmod(pos, 60)
+        dm, ds = divmod(dur, 60)
+        self.track_time.configure(text=f"時間: {pm:02d}:{ps:02d} / {dm:02d}:{ds:02d}")
+
+        # プログレスバー更新（ドラッグ中は更新しない）
+        if not self._seeking and dur > 0:
+            progress = (pos / dur) * 100
+            self.progress_bar.set(progress)
+
+        # 曲変更検知: dbid またはプレイリストが変わったら同期
+        cur_dbid = info.get('dbid')
+        cur_playlist = info.get('playlist')
+        if cur_dbid is not None and (
+            cur_dbid != self._synced_dbid or cur_playlist != self._synced_playlist
+        ):
+            self._synced_dbid = cur_dbid
+            self._synced_playlist = cur_playlist
+            self._on_track_changed(cur_playlist, cur_dbid)
+
     def on_closing(self):
         """終了処理。WM_DELETE_WINDOW と 'm' キーの両方から呼ばれる。
 
@@ -475,6 +699,34 @@ class ITunesTkApp:
             worker = getattr(self, "_track_loading_thread", None)
             if worker is not None and worker.is_alive():
                 worker.join(timeout=0.3)
+        except Exception:
+            pass
+
+        # COMワーカーを停止（get(timeout) 待ちを即時解除するため停止トークンも投入）
+        try:
+            stop = getattr(self, "_com_worker_stop", None)
+            if stop is not None:
+                stop.set()
+        except Exception:
+            pass
+        try:
+            task_q = getattr(self, "_com_task_queue", None)
+            if task_q is not None:
+                task_q.put(_COM_STOP)
+        except Exception:
+            pass
+        try:
+            com_worker = getattr(self, "_com_worker_thread", None)
+            if com_worker is not None and com_worker.is_alive():
+                com_worker.join(timeout=0.5)
+        except Exception:
+            pass
+
+        # ライブラリXML読込スレッドも短く待つ（解析中は中断できないためデッドライン付き）
+        try:
+            loader = getattr(self, "_library_xml_loader_thread", None)
+            if loader is not None and loader.is_alive():
+                loader.join(timeout=0.2)
         except Exception:
             pass
 
@@ -662,8 +914,12 @@ class ITunesTkApp:
         self._after(300, self.update_slot_labels)
 
     def pick_slots(self):
-        names = self.ctrl.get_all_playlists()
+        # UIスレッドで全件走査(get_all_playlists)せず、load_playlists が
+        # バックグラウンド取得済みのキャッシュ(_playlist_raw_names)を使う
+        names = list(getattr(self, "_playlist_raw_names", None) or [])
         if not names:
+            # 未取得なら取得を要求しておき、次回以降はキャッシュが使える
+            self.load_playlists()
             self._show_error("プレイリスト一覧を取得できませんでした")
             return
         folder_map = self._get_playlist_folder_map()
@@ -702,7 +958,6 @@ class ITunesTkApp:
 
     def refresh_playlists(self):
         # 画面上はスロットの存在状態を色分けなどしない。必要なら後で拡張
-        self.ctrl.get_playlists()
         self.load_playlists()
         self.last_action = "プレイリスト更新"
     
@@ -713,9 +968,14 @@ class ITunesTkApp:
         return f"{folder}/{name}" if folder else name
 
     def _get_playlist_folder_map(self) -> dict:
-        """ライブラリXMLから {プレイリスト名: フォルダパス} を構築して返す。XMLが使えない場合は空dict"""
+        """ライブラリXMLから {プレイリスト名: フォルダパス} を構築して返す。XMLが使えない場合は空dict。
+
+        UIスレッドでは plistlib.load を実行しない。キャッシュが未取得/更新ありの場合は
+        バックグラウンド読込を要求したうえで今回は空dictを返す。
+        """
         try:
-            if not self._load_library_xml_if_needed():
+            if not self._library_xml_cache_valid():
+                self._ensure_library_xml_load_started()
                 return {}
             with self._library_xml_lock:
                 playlists = self._library_xml_playlists or []
@@ -748,9 +1008,14 @@ class ITunesTkApp:
         return folder_map
 
     def load_playlists(self):
-        """プレイリスト一覧を読み込む"""
+        """プレイリスト一覧をCOMワーカー経由でバックグラウンド取得する。
+        結果は ("task_result", "playlists", ...) として _ui_queue に届き、
+        update_ui_loop の drain で _apply_playlist_list が呼ばれる。"""
+        self._com_submit("get_playlists", _result_tag="playlists")
+
+    def _apply_playlist_list(self, playlists):
+        """get_playlists の結果をリストボックスへ反映（UIスレッド）"""
         try:
-            playlists = self.ctrl.get_playlists()
             folder_map = self._get_playlist_folder_map()
             self._playlist_raw_names = []
             self.playlist_listbox.delete(0, tk.END)
@@ -760,6 +1025,20 @@ class ITunesTkApp:
                 self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
         except Exception as e:
             logger.error("プレイリスト読み込みエラー: %s", e)
+
+    def _refresh_playlist_labels(self):
+        """表示中プレイリスト一覧のラベルをキャッシュ済みXML情報で更新する（COM不使用）。
+        XML読込完了後にフォルダパス付き表示へ追従するために使う。"""
+        try:
+            folder_map = self._get_playlist_folder_map()
+            selected = set(self.playlist_listbox.curselection() or ())
+            self.playlist_listbox.delete(0, tk.END)
+            for i, name in enumerate(self._playlist_raw_names):
+                self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
+                if i in selected:
+                    self.playlist_listbox.selection_set(i)
+        except Exception as e:
+            logger.error("プレイリストラベル更新エラー: %s", e)
 
     def on_playlist_click(self, event):
         """シングルクリック: 再生せずに選択プレイリストのトラック一覧だけ表示する。
@@ -805,9 +1084,12 @@ class ITunesTkApp:
                 return
             playlist_name = self._playlist_raw_names[selection[0]]
             
-            # 即座に再生を開始（OLE呼び出し）
+            # 即座に再生を開始（COM呼出しはワーカースレッドへ委譲しUIをブロックしない）
             if hasattr(self.ctrl, 'play_playlist'):
-                self.ctrl.play_playlist(playlist_name)
+                self._com_submit(
+                    "play_playlist", playlist_name,
+                    _result_tag=("play_playlist", playlist_name),
+                )
             
             # トラック一覧の読み込み（バックグラウンド）
             self.load_tracks(playlist_name)
@@ -875,7 +1157,8 @@ class ITunesTkApp:
         self._track_loading_cancel_event = cancel_event
         self._track_loading_playlist = playlist_name
 
-        info = self.ctrl.get_current_track_info()
+        # UIスレッドではCOMを呼ばず、COMワーカーのポーリング済みキャッシュを使う
+        info = getattr(self, "_latest_track_info", None) or {}
         self._track_loading_dbid = info.get("dbid") if info else None
 
         # トラック一覧をクリア
@@ -896,22 +1179,18 @@ class ITunesTkApp:
             self._show_error("ライブラリXMLが見つからないためトラック一覧を取得できません")
             return
 
-        ok = False
-        try:
-            ok = self._load_library_xml_if_needed()
-        except Exception:
-            ok = False
-        if not ok:
-            self.last_action = "XML読込失敗"
-            self._show_error("ライブラリXMLの読み込みに失敗しました")
-            return
-
-        with self._library_xml_lock:
-            pls = self._library_xml_playlists or []
-        if not any((p.get('Name') == playlist_name) for p in pls if isinstance(p, dict)):
-            self.last_action = f"XMLにプレイリストがありません: {playlist_name}"
-            self._show_error(f"XMLにプレイリストがありません: {playlist_name}")
-            return
+        # UIスレッドでは plistlib.load を実行しない。キャッシュが有効なときだけ
+        # インメモリの軽量チェックでプレイリスト存在を確認し、未取得/更新ありなら
+        # ワーカースレッド側で読み込ませる（エラーはエラーバッチとしてUIへ届く）。
+        if self._library_xml_cache_valid():
+            with self._library_xml_lock:
+                pls = self._library_xml_playlists or []
+            if not any((p.get('Name') == playlist_name) for p in pls if isinstance(p, dict)):
+                self.last_action = f"XMLにプレイリストがありません: {playlist_name}"
+                self._show_error(f"XMLにプレイリストがありません: {playlist_name}")
+                return
+        else:
+            self.last_action = "ライブラリXML読込中..."
 
         self._track_loading_thread = threading.Thread(
             target=self._stream_playlist_tracks_from_xml_worker,
@@ -961,6 +1240,16 @@ class ITunesTkApp:
 
     def _display_tracks_batch_sync(self, tracks, current_dbid, cancel_event=None):
         """トラックのバッチをUIに表示（同期実行）。cancel_eventは呼出し世代のものを渡す"""
+        # ワーカーからのエラーバッチ: トラック行ではなくエラー表示へ回す
+        if tracks and isinstance(tracks[0], dict) and XML_ERROR_KEY in tracks[0]:
+            msg = tracks[0].get(XML_ERROR_KEY) or "XML読込エラー"
+            self.last_action = msg
+            try:
+                self._show_error(msg)
+            except Exception:
+                pass
+            return
+
         # PlayOrderIndex順にソート
         tracks.sort(key=lambda x: x.get('play_order', 0))
 
@@ -1104,27 +1393,101 @@ class ITunesTkApp:
                 except Exception:
                     continue
             
-            ok = False
             track_name = self.track_tree.item(item, 'text') or None
             current_playlist = self._track_loading_playlist
+            submitted = False
             if pid or dbid is not None:
-                ok = self.ctrl.play_track_by_ids(
-                    source_id, playlist_id, track_id, dbid, pid, track_name, current_playlist, play_order
+                # COM再生呼出し(PlayFirstTrack+sleepを含む)はワーカーへ委譲し、
+                # 結果は result_tag 経由でUIへ反映する（UIスレッドをブロックしない）
+                self._com_submit(
+                    "play_track_by_ids",
+                    source_id, playlist_id, track_id, dbid, pid, track_name,
+                    current_playlist, play_order,
+                    _result_tag=("play_track", track_name),
                 )
+                submitted = True
             elif location:
                 fn = getattr(self.ctrl, 'play_track_by_location', None)
                 if callable(fn):
-                    ok = bool(fn(location))
+                    self._com_submit(
+                        "play_track_by_location", location,
+                        _result_tag=("play_track", track_name),
+                    )
+                    submitted = True
 
-            if ok:
-                self.last_action = f"トラック再生: {self.track_tree.item(item, 'text')}"
+            if submitted:
+                self.last_action = f"トラック再生要求: {track_name or '-'}"
             else:
                 self.last_action = "トラック再生失敗"
         except Exception as e:
             logger.error("トラック選択エラー: %s", e)
 
+    def _library_xml_cache_valid(self) -> bool:
+        """UIスレッド用の軽量チェック: キャッシュが現在のmtimeに一致していれば True。
+        plistlib.load は実行しない（解析は必ずバックグラウンドスレッド側）。"""
+        path = getattr(self, "_library_xml_path", "")
+        if not path:
+            return False
+        try:
+            mtime = float(os.stat(path).st_mtime)
+        except Exception:
+            return False
+        try:
+            with self._library_xml_lock:
+                return (
+                    self._library_xml_tracks is not None
+                    and self._library_xml_playlists is not None
+                    and self._library_xml_mtime == mtime
+                )
+        except Exception:
+            return False
+
+    def _ensure_library_xml_load_started(self):
+        """ライブラリXMLのバックグラウンド読込スレッドを起動する（多重起動防止）。
+        キャッシュが既に有効なら何もしない。"""
+        if not getattr(self, "_library_xml_path", ""):
+            return
+        if not getattr(self, "_library_xml_exists", False):
+            return
+        if self._library_xml_cache_valid():
+            return
+        t = getattr(self, "_library_xml_loader_thread", None)
+        if t is not None and t.is_alive():
+            return
+        try:
+            t = threading.Thread(
+                target=self._library_xml_loader_worker,
+                daemon=True,
+                name="library-xml-loader",
+            )
+            self._library_xml_loader_thread = t
+            t.start()
+        except Exception as e:
+            logger.error("ライブラリXMLローダー起動失敗: %s", e)
+            self._library_xml_loader_thread = None
+
+    def _library_xml_loader_worker(self):
+        """バックグラウンドで plistlib.load を実行し、完了をUIキューへ通知する"""
+        try:
+            ok = self._load_library_xml_if_needed()
+        except Exception:
+            ok = False
+        self._ui_put("library_xml_loaded", ok)
+
+    def _on_library_xml_loaded(self, ok):
+        """XML読込完了通知（UIスレッド）。表示ラベルのフォルダパスを追従させる"""
+        if self._closing or not ok:
+            return
+        self._refresh_playlist_labels()
+
     def _load_library_xml_if_needed(self) -> bool:
-        """ライブラリXMLを必要時に読み込み、キャッシュする。成功でTrue。"""
+        """ライブラリXMLを必要時に読み込み、キャッシュする。成功でTrue。
+
+        注意: plistlib.load は大規模ライブラリでは秒単位かかるため、
+        UIスレッドからは呼ばないこと。UI側の確認は _library_xml_cache_valid を使い、
+        解析は _stream_playlist_tracks_from_xml_worker / _library_xml_loader_worker
+        などのバックグラウンドスレッドでのみ行う。
+        """
         path = self._library_xml_path
         if not path:
             return False
@@ -1134,6 +1497,7 @@ class ITunesTkApp:
         except Exception:
             return False
 
+        # キャッシュ有効チェックは短いロック区間で行う
         with self._library_xml_lock:
             if (
                 self._library_xml_tracks is not None
@@ -1141,20 +1505,33 @@ class ITunesTkApp:
                 and self._library_xml_mtime == mtime
             ):
                 return True
-            try:
-                with open(path, 'rb') as f:
-                    data = plistlib.load(f)
-                tracks = data.get('Tracks') or {}
-                playlists = data.get('Playlists') or []
-                if not isinstance(tracks, dict) or not isinstance(playlists, list):
-                    return False
-                # Tracksのキーは文字列のTrack IDが多い
-                self._library_xml_tracks = tracks
-                self._library_xml_playlists = playlists
-                self._library_xml_mtime = mtime
+
+        # plistlib.load はロック外で実行する。
+        # ロック保持中に解析すると、キャッシュ確認のための _library_xml_cache_valid
+        # （UIスレッド）が解析完了までブロックされてしまうため。
+        try:
+            with open(path, 'rb') as f:
+                data = plistlib.load(f)
+        except Exception:
+            return False
+        tracks = data.get('Tracks') or {}
+        playlists = data.get('Playlists') or []
+        if not isinstance(tracks, dict) or not isinstance(playlists, list):
+            return False
+
+        with self._library_xml_lock:
+            # 並行する別ローダーが先に同じ mtime をコミット済みならそれを使う
+            if (
+                self._library_xml_tracks is not None
+                and self._library_xml_playlists is not None
+                and self._library_xml_mtime == mtime
+            ):
                 return True
-            except Exception:
-                return False
+            # Tracksのキーは文字列のTrack IDが多い
+            self._library_xml_tracks = tracks
+            self._library_xml_playlists = playlists
+            self._library_xml_mtime = mtime
+            return True
 
     def _stream_playlist_tracks_from_xml_worker(
         self,
@@ -1163,11 +1540,22 @@ class ITunesTkApp:
         on_batch,
         cancel_event: threading.Event | None,
     ) -> None:
-        """XML(plist)からプレイリストのトラック一覧を抽出してバッチで返す（バックグラウンド用）"""
+        """XML(plist)からプレイリストのトラック一覧を抽出してバッチで返す（バックグラウンド用）
+
+        plistlib.load を含む重い解析はこのワーカースレッド側で行う。
+        失敗時は {XML_ERROR_KEY: メッセージ} のエラーバッチを on_batch で送り、
+        UI側の _display_tracks_batch_sync がエラー表示へ回す。
+        """
+        def _emit_error(message: str) -> None:
+            try:
+                on_batch([{XML_ERROR_KEY: message}])
+            except Exception:
+                pass
+
         try:
             ok = self._load_library_xml_if_needed()
             if not ok:
-                # XMLが読めない場合は、呼び出し元でフォールバックしない（現状はXML優先時のみ呼ぶ）ため、空で返す
+                _emit_error("ライブラリXMLの読み込みに失敗しました")
                 return
             with self._library_xml_lock:
                 tracks_dict = self._library_xml_tracks or {}
@@ -1184,6 +1572,7 @@ class ITunesTkApp:
             except Exception:
                 continue
         if not target_pl:
+            _emit_error(f"XMLにプレイリストがありません: {playlist_name}")
             return
 
         items = target_pl.get('Playlist Items') or []
@@ -1266,17 +1655,45 @@ class ITunesTkApp:
                 pass
     
     def on_progress_change(self, value):
-        """プログレスバー変更時"""
-        if self._seeking:
+        """プログレスバー変更時。
+
+        ドラッグ中のモーションイベントごとに同期COM(get_current_track_info /
+        set_player_position)を呼ばないよう、after でデバウンスしてから
+        COMワーカー経由でシークを実行する。
+        """
+        if not self._seeking:
+            return
+        self._seek_pending_value = value
+        old_id = getattr(self, "_seek_after_id", None)
+        if old_id is not None:
             try:
-                info = self.ctrl.get_current_track_info()
-                if info:
-                    duration = info.get('duration', 0)
-                    if duration > 0:
-                        position = float(value) * duration / 100
-                        self.ctrl.set_player_position(position)
+                self.root.after_cancel(old_id)
             except Exception:
                 pass
+        self._seek_after_id = self._after(self.SEEK_DEBOUNCE_MS, self._flush_pending_seek)
+
+    def _flush_pending_seek(self):
+        """デバウンス済みシークをCOMワーカーへ投入（発火済みコールバックの二重実行は無害）"""
+        self._seek_after_id = None
+        if self._closing:
+            return
+        value = getattr(self, "_seek_pending_value", None)
+        self._seek_pending_value = None
+        if value is None:
+            return
+        # 曲長はポーリング済みキャッシュから取得（UIスレッドでCOMを呼ばない）
+        info = getattr(self, "_latest_track_info", None) or {}
+        try:
+            duration = float(info.get('duration') or 0)
+        except Exception:
+            duration = 0.0
+        if duration <= 0:
+            return
+        try:
+            position = float(value) * duration / 100.0
+        except Exception:
+            return
+        self._com_submit("set_player_position", position)
     
     # トグルメソッド
     def toggle_progress(self):
@@ -1317,21 +1734,24 @@ class ITunesTkApp:
         """現在再生中のプレイリストとトラックに移動"""
         try:
             self._manual_playlist_view = False
-            # 現在のプレイリストを取得（プラットフォーム共通API経由）
-            playlist_name = self.ctrl.get_current_playlist_name()
+            # まずポーリング済みキャッシュを使い、無ければプラットフォーム共通APIで取得
+            info = getattr(self, "_latest_track_info", None) or {}
+            playlist_name = info.get('playlist')
+            if not playlist_name:
+                playlist_name = self.ctrl.get_current_playlist_name()
             if not playlist_name:
                 self.last_action = "再生中のプレイリストがありません"
                 return
-            
+
             # プレイリスト一覧から該当プレイリストを選択
             self._select_playlist_in_listbox(playlist_name)
 
             # トラック一覧を読み込む
             self.load_tracks(playlist_name)
-            
-            # 現在のトラックを選択
-            info = self.ctrl.get_current_track_info()
-            current_dbid = info.get('dbid') if info else None
+
+            # 現在のトラックを選択（ポーリング済みキャッシュのみ使用しCOMは呼ばない。
+            # 未取得でも読込完了時に _track_loading_dbid 経由でハイライトされる）
+            current_dbid = info.get('dbid')
             
             if current_dbid:
                 # トラック一覧から該当トラックを探して選択
@@ -1355,11 +1775,15 @@ class ITunesTkApp:
             logger.error("再生中の曲へ移動エラー: %s", e)
 
     def _sync_to_itunes_state(self):
-        """iTunesの現在の再生状態をUIに反映する（起動直後用）"""
+        """iTunesの現在の再生状態をUIに反映する（起動直後用）。
+
+        COMワーカーのポーリング済みキャッシュのみ参照する。未取得なら何もしない
+        （次回以降のポーリング結果が _on_track_changed 経由で反映される）。
+        """
         if self._closing:
             return
         try:
-            info = self.ctrl.get_current_track_info()
+            info = getattr(self, "_latest_track_info", None)
             if not info:
                 return
             cur_dbid = info.get('dbid')
@@ -1437,33 +1861,9 @@ class ITunesTkApp:
             base_interval = 1000
         next_interval = base_interval
         try:
-            info = self.ctrl.get_current_track_info()
-            if info:
-                playing = info.get('is_playing', False)
-                self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
-                self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
-                self.track_artist.configure(text=f"アーティスト: {info.get('artist', '-')}")
-                self.track_album.configure(text=f"アルバム: {info.get('album', '-')}")
-                pos = int(info.get('position', 0) or 0)
-                dur = int(info.get('duration', 0) or 0)
-                pm, ps = divmod(pos, 60)
-                dm, ds = divmod(dur, 60)
-                self.track_time.configure(text=f"時間: {pm:02d}:{ps:02d} / {dm:02d}:{ds:02d}")
-
-                # プログレスバー更新（ドラッグ中は更新しない）
-                if not self._seeking and dur > 0:
-                    progress = (pos / dur) * 100
-                    self.progress_bar.set(progress)
-
-                # 曲変更検知: dbid またはプレイリストが変わったら同期
-                cur_dbid = info.get('dbid')
-                cur_playlist = info.get('playlist')
-                if cur_dbid is not None and (
-                    cur_dbid != self._synced_dbid or cur_playlist != self._synced_playlist
-                ):
-                    self._synced_dbid = cur_dbid
-                    self._synced_playlist = cur_playlist
-                    self._on_track_changed(cur_playlist, cur_dbid)
+            # COMの同期呼出し(get_current_track_info)は行わない。
+            # COMワーカーが _ui_queue へ積んだポーリング結果を drain して反映する。
+            self._drain_ui_queue()
 
             # BPM表示更新
             if self.bpm_value:
