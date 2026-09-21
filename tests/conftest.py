@@ -20,3 +20,52 @@ win32com.client = MagicMock(name="win32com.client")
 sys.modules.setdefault("win32com", win32com)
 sys.modules.setdefault("win32com.client", win32com.client)
 sys.modules.setdefault("pythoncom", MagicMock(name="pythoncom"))
+
+
+def _install_fake_tkinter() -> None:
+    """最小限のフェイク tkinter モジュールを sys.modules に登録する。
+
+    tkinter が存在しない環境で gui_tk を import 可能にするための stub。
+    - `tk.Toplevel` 等のクラス名 → 同名の新規クラス（基底クラス/isinstance に使える）
+    - `tk.TclError` 等の *Error → Exception 派生クラス
+    - `tk.BOTH` 等の大文字名 → 定数（名前文字列）
+    - その他 → MagicMock
+    """
+    if "tkinter" in sys.modules:
+        return
+
+    cache: dict = {}
+
+    def _resolve(fullname: str, attr: str):
+        key = f"{fullname}.{attr}"
+        if key not in cache:
+            if attr.isupper():
+                cache[key] = attr
+            elif attr.endswith("Error"):
+                cache[key] = type(attr, (Exception,), {})
+            elif attr and attr[0].isupper():
+                cache[key] = type(attr, (), {})
+            else:
+                cache[key] = MagicMock(name=key)
+        return cache[key]
+
+    def _make_module(fullname: str) -> types.ModuleType:
+        mod = types.ModuleType(fullname)
+
+        def _getattr(attr: str, _fn: str = fullname):
+            if attr.startswith("__") and attr.endswith("__"):
+                raise AttributeError(attr)
+            return _resolve(_fn, attr)
+
+        mod.__getattr__ = _getattr
+        return mod
+
+    tk = _make_module("tkinter")
+    for sub in ("ttk", "messagebox", "simpledialog"):
+        submod = _make_module(f"tkinter.{sub}")
+        setattr(tk, sub, submod)
+        sys.modules[f"tkinter.{sub}"] = submod
+    sys.modules["tkinter"] = tk
+
+
+_install_fake_tkinter()

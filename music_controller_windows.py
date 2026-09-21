@@ -84,18 +84,31 @@ class WindowsMusicController:
     
     def play_pause(self):
         """再生/一時停止を切り替える"""
-        if self.itunes:
+        if not self.itunes:
+            return
+        try:
             self.itunes.PlayPause()
-    
+        except Exception as e:
+            # 一時的な COM エラー（RPC_E_CALL_REJECTED 等）を Tk コールバックへ伝播させない
+            logger.error("再生/一時停止エラー: %s", e)
+
     def play_next_track(self):
         """次のトラックへ"""
-        if self.itunes:
+        if not self.itunes:
+            return
+        try:
             self.itunes.NextTrack()
-    
+        except Exception as e:
+            logger.error("次のトラックへの移動エラー: %s", e)
+
     def play_previous_track(self):
         """前のトラックへ"""
-        if self.itunes:
+        if not self.itunes:
+            return
+        try:
             self.itunes.PreviousTrack()
+        except Exception as e:
+            logger.error("前のトラックへの移動エラー: %s", e)
     
     def skip_forward(self, seconds: int = 10):
         """指定秒数分スキップ"""
