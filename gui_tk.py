@@ -202,6 +202,9 @@ class ITunesTkApp:
         # 曲変更検知用
         self._synced_dbid: int | None = None
         self._synced_playlist: str | None = None
+        # 再生コンテキストのプレイリスト名（次/前曲遷移でプレイリスト内隣接曲へ進むための情報。
+        # play_track_by_ids / play_playlist の成功時に _handle_task_result で更新される）
+        self._playback_playlist: str | None = None
 
         # update_ui_loop の連続失敗カウンタ（バックオフ用）
         self._update_loop_failures = 0
@@ -658,8 +661,15 @@ class ITunesTkApp:
                     self._log_action(
                         f"トラック再生: {name or '-'}" if result else "トラック再生失敗"
                     )
-                elif kind == "play_playlist" and not result:
-                    self._log_action(f"プレイリスト再生失敗: {name or '-'}")
+                    if result:
+                        # 再生コンテキストを記録（tag[2] にプレイリスト名。
+                        # 無ければライブラリ/不明コンテキストなのでクリア）
+                        self._playback_playlist = tag[2] if len(tag) > 2 else None
+                elif kind == "play_playlist":
+                    if result:
+                        self._playback_playlist = name
+                    else:
+                        self._log_action(f"プレイリスト再生失敗: {name or '-'}")
         except Exception as e:
             logger.error("タスク結果処理エラー: %s", e)
 
@@ -930,10 +940,23 @@ class ITunesTkApp:
         self._log_action(f"-{self.config.config.skip_seconds}秒")
 
     def next_track(self):
-        self.ctrl.play_next_track(); self._log_action("次の曲")
+        # プレイリスト内インデックス走査を含むCOM呼出しはワーカーへ委譲する
+        # （UIスレッドをブロックしない）。再生コンテキストのプレイリスト名を渡し、
+        # コントローラー側でプレイリスト内の隣接曲へ遷移させる（Issue #18）。
+        playlist = getattr(self, "_playback_playlist", None)
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit("play_next_track", playlist)
+        else:
+            self.ctrl.play_next_track(playlist)
+        self._log_action("次の曲")
 
     def prev_track(self):
-        self.ctrl.play_previous_track(); self._log_action("前の曲")
+        playlist = getattr(self, "_playback_playlist", None)
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit("play_previous_track", playlist)
+        else:
+            self.ctrl.play_previous_track(playlist)
+        self._log_action("前の曲")
 
     def add_to_slot(self, idx: int):
         widget_idx = idx % self.bank_size
@@ -1461,7 +1484,7 @@ class ITunesTkApp:
                     "play_track_by_ids",
                     source_id, playlist_id, track_id, dbid, pid, track_name,
                     current_playlist, play_order,
-                    _result_tag=("play_track", track_name),
+                    _result_tag=("play_track", track_name, current_playlist),
                 )
                 submitted = True
             elif location:

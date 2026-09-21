@@ -124,23 +124,155 @@ class WindowsMusicController:
             # 一時的な COM エラー（RPC_E_CALL_REJECTED 等）を Tk コールバックへ伝播させない
             logger.error("再生/一時停止エラー: %s", e)
 
-    def play_next_track(self):
-        """次のトラックへ"""
-        if not self.itunes:
-            return
-        try:
-            self.itunes.NextTrack()
-        except Exception as e:
-            logger.error("次のトラックへの移動エラー: %s", e)
+    def play_next_track(self, playlist_name: str | None = None):
+        """次のトラックへ。
 
-    def play_previous_track(self):
-        """前のトラックへ"""
+        プレイリストコンテキストが分かる場合は iTunes の再生キューではなく、
+        そのプレイリストの表示順で隣接するトラックを直接再生する（Issue #18）。
+        playlist_name: GUI が記録している再生コンテキストのプレイリスト名。
+        """
+        self._play_adjacent_track(1, playlist_name)
+
+    def play_previous_track(self, playlist_name: str | None = None):
+        """前のトラックへ。play_next_track と同じくプレイリストコンテキストを優先する"""
+        self._play_adjacent_track(-1, playlist_name)
+
+    def _play_adjacent_track(self, direction: int, playlist_name: str | None = None):
+        """プレイリストコンテキストでの隣接トラック遷移。
+
+        解決順:
+        1. playlist_name 引数（GUI が記録した再生コンテキスト）
+        2. itunes.CurrentPlaylist（iTunes 側の再生中プレイリスト）
+        いずれでも現在トラックがプレイリスト内に見つからなければ
+        NextTrack()/PreviousTrack() にフォールバックする。
+        """
         if not self.itunes:
             return
         try:
-            self.itunes.PreviousTrack()
+            current = getattr(self.itunes, 'CurrentTrack', None)
+            dbid = getattr(current, 'TrackDatabaseID', None) if current else None
+            if isinstance(dbid, int):
+                names: List[str] = []
+                if playlist_name:
+                    names.append(playlist_name)
+                current_pl_name = self.get_current_playlist_name()
+                if current_pl_name and current_pl_name not in names:
+                    names.append(current_pl_name)
+                for name in names:
+                    playlist = self._find_playlist_by_name(name)
+                    if playlist is None:
+                        continue
+                    if self._play_playlist_neighbor(playlist, direction, current, dbid):
+                        return
+            if direction > 0:
+                self.itunes.NextTrack()
+            else:
+                self.itunes.PreviousTrack()
         except Exception as e:
-            logger.error("前のトラックへの移動エラー: %s", e)
+            logger.error("トラック遷移エラー: %s", e)
+
+    def _play_playlist_neighbor(self, playlist, direction: int, current_track, database_id: int) -> bool:
+        """現在トラックのプレイリスト内インデックス ± direction のトラックを再生する。
+
+        PlayFirstTrack() は呼ばない: コンテキスト確立済みの隣接遷移では
+        先頭曲が一瞬再生される副作用の方が害になるため、対象トラックを直接 Play() する。
+        """
+        try:
+            tracks = getattr(playlist, 'Tracks', None)
+            if tracks is None:
+                return False
+            count = tracks.Count
+        except Exception:
+            return False
+
+        index_hint = getattr(current_track, 'PlayOrderIndex', None)
+        if not isinstance(index_hint, int):
+            index_hint = None
+        track_name = getattr(current_track, 'Name', None)
+
+        idx = self._find_playlist_track_index(
+            playlist, tracks, count, database_id, track_name, index_hint
+        )
+        if idx is None:
+            return False
+
+        target_idx = idx + direction
+        if not 1 <= target_idx <= count:
+            logger.debug(
+                "No adjacent track in '%s' (idx=%s dir=%s count=%s)",
+                getattr(playlist, 'Name', '?'), idx, direction, count,
+            )
+            return False
+        try:
+            tr = tracks.Item(target_idx)
+            logger.debug(
+                "Playing adjacent track #%s in '%s' (dir=%s)",
+                target_idx, getattr(playlist, 'Name', '?'), direction,
+            )
+            tr.Play()
+            return True
+        except Exception as e:
+            logger.debug("隣接トラックの再生に失敗: %s", e)
+            return False
+
+    def _find_playlist_track_index(
+        self,
+        playlist,
+        tracks,
+        count: int,
+        database_id: int,
+        track_name: str | None = None,
+        index_hint: int | None = None,
+    ) -> int | None:
+        """プレイリスト内で TrackDatabaseID が一致するトラックの 1 始まりインデックスを返す。
+
+        index_hint（CurrentTrack.PlayOrderIndex 等）→ Search API の POI → 全件走査の順で試す。
+        """
+        def _matches(idx: int) -> bool:
+            try:
+                return getattr(tracks.Item(idx), 'TrackDatabaseID', None) == database_id
+            except Exception:
+                return False
+
+        # 1. ヒントインデックス周辺
+        if index_hint is not None:
+            for offset in (0, -1, 1, -2, 2):
+                i = index_hint + offset
+                if 1 <= i <= count and _matches(i):
+                    return i
+
+        # 2. Search API で POI を取得し周辺を確認
+        if track_name and hasattr(playlist, 'Search'):
+            try:
+                search_result = playlist.Search(track_name, 5)  # 5 = SongNames
+                if search_result and getattr(search_result, 'Count', 0) > 0:
+                    for candidate in search_result:
+                        try:
+                            if getattr(candidate, 'TrackDatabaseID', None) != database_id:
+                                continue
+                            poi = getattr(candidate, 'PlayOrderIndex', None)
+                            if isinstance(poi, int):
+                                for i in range(max(1, poi - 10), min(count + 1, poi + 11)):
+                                    if _matches(i):
+                                        return i
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        # 3. 全件走査
+        try:
+            idx = 0
+            for tr in tracks:
+                idx += 1
+                try:
+                    if getattr(tr, 'TrackDatabaseID', None) == database_id:
+                        return idx
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
     
     def skip_forward(self, seconds: int = 10):
         """指定秒数分スキップ"""
