@@ -243,6 +243,88 @@ def test_on_progress_change_ignores_when_not_seeking():
     app.ctrl.set_player_position.assert_not_called()
 
 
+# --- 2b. シークバーのクリック位置ジャンプ（Issue #24） ---
+
+def _fake_event(x):
+    return MagicMock(name="event", x=x)
+
+
+def test_progress_bar_press_seeks_to_click_position():
+    """トラフクリックは固定ステップではなく event.x/幅 の割合へジャンプする"""
+    app = _make_app()
+    app.progress_bar.winfo_width.return_value = 200
+    app._latest_track_info = {"duration": 200.0}
+
+    result = app._on_progress_press(_fake_event(50))  # 25%位置
+
+    # デフォルトの「1ページ移動」を抑制しつつシーク操作を開始する
+    assert result == "break"
+    assert app._seeking is True
+    # スライダーをクリック位置へ動かし、デバウンス経路でシークをスケジュール
+    app.progress_bar.set.assert_called_once_with(25.0)
+    assert app._seek_pending_value == 25.0
+    app.root.after.assert_called_once()
+    assert app.root.after.call_args[0][0] == app.SEEK_DEBOUNCE_MS
+
+    # デバウンス発火 → 曲長 200s の 25% = 50s へ COM ワーカー経由でシーク
+    app._flush_pending_seek()
+    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
+    assert fn == "set_player_position"
+    assert args == (50.0,)
+
+
+def test_progress_bar_press_clips_position_to_ends():
+    """event.x がバー範囲外でも 0%〜100% にクリップする"""
+    app = _make_app()
+    app.progress_bar.winfo_width.return_value = 200
+    app._latest_track_info = {"duration": 100.0}
+
+    app._on_progress_press(_fake_event(-20))
+    app.progress_bar.set.assert_called_with(0.0)
+    assert app._seek_pending_value == 0.0
+
+    app._on_progress_press(_fake_event(999))
+    app.progress_bar.set.assert_called_with(100.0)
+    assert app._seek_pending_value == 100.0
+
+
+def test_progress_bar_press_ignores_zero_width():
+    """未レイアウト（幅0）では値を変えず、デフォルト動作だけ抑制する"""
+    app = _make_app()
+    app.progress_bar.winfo_width.return_value = 0
+
+    result = app._on_progress_press(_fake_event(10))
+
+    assert result == "break"
+    assert app._seeking is True
+    app.progress_bar.set.assert_not_called()
+    app.root.after.assert_not_called()
+
+
+def test_progress_bar_drag_follows_mouse_position():
+    """B1-Motion ドラッグ中も event.x 基準のデバウンスシークを発行する"""
+    app = _make_app()
+    app.progress_bar.winfo_width.return_value = 200
+    app._seeking = True
+    app._latest_track_info = {"duration": 200.0}
+
+    result = app._on_progress_drag(_fake_event(150))  # 75%位置
+
+    assert result == "break"
+    app.progress_bar.set.assert_called_with(75.0)
+    assert app._seek_pending_value == 75.0
+
+
+def test_progress_bar_release_clears_seeking_flag():
+    """ボタン解放でドラッグ中フラグを落とす（進捗の自動追従を再開させる）"""
+    app = _make_app()
+    app._seeking = True
+
+    app._on_progress_release(_fake_event(0))
+
+    assert app._seeking is False
+
+
 # --- 3. update_ui_loop のバックグラウンドポーリング化 ---
 
 def test_update_ui_loop_does_not_call_get_current_track_info():
