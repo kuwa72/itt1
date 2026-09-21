@@ -33,7 +33,6 @@ def _make_app() -> ITunesTkApp:
     app.track_time = MagicMock(name="track_time")
     app.progress_bar = MagicMock(name="progress_bar")
     app.bpm_label = MagicMock(name="bpm_label")
-    app.last_action_label = MagicMock(name="last_action_label")
     app.bpm_value = None
     app.last_action = "-"
     app._seeking = False

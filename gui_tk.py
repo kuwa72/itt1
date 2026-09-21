@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
+from collections import deque
 from typing import List
 import logging
 import os
@@ -104,6 +105,8 @@ class ITunesTkApp:
     # シークバードラッグのデバウンス間隔（ミリ秒）。モーションごとの同期COMを避け、
     # ドラッグが止まってから1回だけシークを実行する
     SEEK_DEBOUNCE_MS = 150
+    # アクションログの保持件数（直近 N 件。超過分は古い行から削除）
+    ACTION_LOG_MAX_ENTRIES = 50
     # 終了処理中フラグ / モーダルダイアログ表示カウント。
     # クラス既定値を置き、__init__ 未到達のインスタンスでも on_key 等が安全に参照できるようにする
     _closing: bool = False
@@ -135,17 +138,20 @@ class ITunesTkApp:
                 pass
         else:
             self.quick_slots = self.config.get_quick_slots()
+        # アクションログ履歴（"HH:MM:SS msg" 形式の最新 ACTION_LOG_MAX_ENTRIES 件。
+        # build_ui より先に記録される起動時メッセージも保持するため先に初期化）
+        self._action_log: deque = deque(maxlen=self.ACTION_LOG_MAX_ENTRIES)
         xml_path, xml_exists = ("", False)
         try:
             xml_path, xml_exists = self.config.check_library_xml_exists()
         except Exception:
             xml_path, xml_exists = ("", False)
         if xml_path and xml_exists:
-            self.last_action = f"XML検出: {xml_path}"
+            self._log_action(f"XML検出: {xml_path}")
         elif xml_path and not xml_exists:
-            self.last_action = f"XML未検出: {xml_path}"
+            self._log_action(f"XML未検出: {xml_path}")
         else:
-            self.last_action = "XML未設定"
+            self._log_action("XML未設定")
         self._library_xml_path = xml_path
         self._library_xml_exists = bool(xml_path and xml_exists)
         self._library_xml_mtime: float | None = None
@@ -262,14 +268,11 @@ class ITunesTkApp:
         top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
         top_row.columnconfigure(0, weight=0)
         top_row.columnconfigure(1, weight=1)
-        top_row.columnconfigure(2, weight=0)
 
         self.track_status = ttk.Label(top_row, text="⏸ 一時停止", font=("", 14, "bold"))
         self.track_status.grid(row=0, column=0, sticky="w")
         self.track_title = ttk.Label(top_row, text="曲名: -", font=("", 16, "bold"))
         self.track_title.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        self.last_action_label = ttk.Label(top_row, text="最終アクション: 起動", foreground="#ff9800", font=("", 14, "bold"))
-        self.last_action_label.grid(row=0, column=2, sticky="e")
 
         # BPM panel (inside track panel)
         self.bpm_frame = ttk.Frame(track_frame)
@@ -302,7 +305,19 @@ class ITunesTkApp:
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
         self.middle_paned.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        
+
+        # アクションログ（最終アクションの履歴。タイムスタンプ付きで末尾へ追記し、
+        # 直近 ACTION_LOG_MAX_ENTRIES 件を保持）
+        self.action_log_frame = ttk.LabelFrame(container, text="ログ")
+        self.action_log_frame.pack(fill=tk.X, pady=(6, 0))
+        self.action_log_listbox = tk.Listbox(
+            self.action_log_frame, height=5, exportselection=False,
+        )
+        self.action_log_listbox.pack(fill=tk.X, padx=4, pady=4)
+        # build_ui より前に記録された起動時メッセージを反映
+        for _entry in getattr(self, "_action_log", ()):
+            self.action_log_listbox.insert(tk.END, _entry)
+
         # プレイリスト一覧
         self.playlist_frame = ttk.LabelFrame(self.middle_paned, text="プレイリスト")
         self.middle_paned.add(self.playlist_frame, weight=1)
@@ -620,6 +635,8 @@ class ITunesTkApp:
                     latest_info = msg[1]
                 elif kind == "task_result":
                     self._handle_task_result(msg[1], msg[2])
+                elif kind == "log":
+                    self._log_action(msg[1])
                 elif kind == "library_xml_loaded":
                     self._on_library_xml_loaded(msg[1])
             except Exception as e:
@@ -638,13 +655,54 @@ class ITunesTkApp:
                 kind = tag[0]
                 name = tag[1] if len(tag) > 1 else None
                 if kind == "play_track":
-                    self.last_action = (
+                    self._log_action(
                         f"トラック再生: {name or '-'}" if result else "トラック再生失敗"
                     )
                 elif kind == "play_playlist" and not result:
-                    self.last_action = f"プレイリスト再生失敗: {name or '-'}"
+                    self._log_action(f"プレイリスト再生失敗: {name or '-'}")
         except Exception as e:
             logger.error("タスク結果処理エラー: %s", e)
+
+    def _log_action(self, msg: str):
+        """最終アクションを記録する唯一の入口。
+
+        - self.last_action に最新メッセージを保持（従来の参照互換）
+        - _action_log に "HH:MM:SS msg" 形式で追記（deque の maxlen で自動的に古い行を削除）
+        - ログ表示枠 action_log_listbox があれば末尾へ追記し、溢れた分を先頭から削除
+
+        UIスレッド以外から呼ばれた場合は _ui_queue 経由でUIスレッドへ回す
+        （TkウィジェットはUIスレッドからのみ触れる原則を維持）。
+        現状の全呼出し箇所はUIスレッドだが、将来ワーカーから直接呼ばれても
+        安全側に倒すためガードする。
+        """
+        if threading.current_thread() is not threading.main_thread():
+            q = getattr(self, "_ui_queue", None)
+            if q is not None:
+                try:
+                    q.put(("log", msg))
+                    return
+                except Exception:
+                    pass
+            # キューが無い/詰め込めない場合でも落とさず履歴だけは残す
+        self.last_action = msg
+        try:
+            entry = f"{time.strftime('%H:%M:%S')} {msg}"
+        except Exception:
+            entry = str(msg)
+        log = getattr(self, "_action_log", None)
+        if log is None:
+            log = self._action_log = deque(maxlen=self.ACTION_LOG_MAX_ENTRIES)
+        log.append(entry)
+        listbox = getattr(self, "action_log_listbox", None)
+        if listbox is None:
+            return
+        try:
+            listbox.insert(tk.END, entry)
+            while listbox.size() > self.ACTION_LOG_MAX_ENTRIES:
+                listbox.delete(0)
+            listbox.see(tk.END)
+        except Exception:
+            pass
 
     def _apply_track_info(self, info):
         """ポーリング済みのトラック情報をウィジェットへ反映（UIスレッド。COM不使用）"""
@@ -800,7 +858,7 @@ class ITunesTkApp:
     def toggle_slot_bank(self):
         self.slot_bank = 0 if self.slot_bank else 1
         self.update_slot_labels()
-        self.last_action = f"バンク: {self.slot_bank + 1}"
+        self._log_action(f"バンク: {self.slot_bank + 1}")
 
     def on_key(self, event: tk.Event):
         try:
@@ -856,26 +914,26 @@ class ITunesTkApp:
         except Exception as e:
             # bind_all 経由のホットキー処理で例外が起きても Tk へ伝播させない
             logger.error("キー入力処理エラー: %s", e)
-            self.last_action = f"キーエラー: {e}"
+            self._log_action(f"キーエラー: {e}")
 
     # Actions
     def toggle_play_pause(self):
         self.ctrl.play_pause()
-        self.last_action = "再生/一時停止"
+        self._log_action("再生/一時停止")
 
     def skip_forward(self):
         self.ctrl.skip_forward(self.config.config.skip_seconds)
-        self.last_action = f"+{self.config.config.skip_seconds}秒"
+        self._log_action(f"+{self.config.config.skip_seconds}秒")
 
     def skip_backward(self):
         self.ctrl.skip_backward(self.config.config.skip_seconds)
-        self.last_action = f"-{self.config.config.skip_seconds}秒"
+        self._log_action(f"-{self.config.config.skip_seconds}秒")
 
     def next_track(self):
-        self.ctrl.play_next_track(); self.last_action = "次の曲"
+        self.ctrl.play_next_track(); self._log_action("次の曲")
 
     def prev_track(self):
-        self.ctrl.play_previous_track(); self.last_action = "前の曲"
+        self.ctrl.play_previous_track(); self._log_action("前の曲")
 
     def add_to_slot(self, idx: int):
         widget_idx = idx % self.bank_size
@@ -884,16 +942,16 @@ class ITunesTkApp:
             # Search APIベースなのでキャッシュ不要、即座に追加
             result = self.ctrl.add_to_playlist(name)
             if result == "already_exists":
-                self.last_action = f"既に存在: {name}"
+                self._log_action(f"既に存在: {name}")
                 self._flash_slot(widget_idx, "warning")
             elif result == "added":
-                self.last_action = f"追加: {name}"
+                self._log_action(f"追加: {name}")
                 self._flash_slot(widget_idx, "success")
             else:
-                self.last_action = f"追加失敗: {name}"
+                self._log_action(f"追加失敗: {name}")
                 self._flash_slot(widget_idx, "error")
         else:
-            self.last_action = "未設定スロット"
+            self._log_action("未設定スロット")
             self._flash_slot(widget_idx, "warning")
 
     def _flash_slot(self, widget_idx: int, status: str):
@@ -939,7 +997,7 @@ class ITunesTkApp:
         self.config.set_quick_slots(self.quick_slots)
         self.slot_bank = 0
         self.update_slot_labels()
-        self.last_action = "クイックスロット更新"
+        self._log_action("クイックスロット更新")
 
     def create_single_playlist(self):
         from tkinter import simpledialog
@@ -950,16 +1008,16 @@ class ITunesTkApp:
         finally:
             self._end_modal()
         if not name:
-            self.last_action = "プレイリスト作成キャンセル"
+            self._log_action("プレイリスト作成キャンセル")
             return
         ok = self.ctrl.create_playlist(name)
         self.refresh_playlists()
-        self.last_action = f"プレイリスト作成: {'成功' if ok else '失敗'} ({name})"
+        self._log_action(f"プレイリスト作成: {'成功' if ok else '失敗'} ({name})")
 
     def refresh_playlists(self):
         # 画面上はスロットの存在状態を色分けなどしない。必要なら後で拡張
         self.load_playlists()
-        self.last_action = "プレイリスト更新"
+        self._log_action("プレイリスト更新")
     
     @staticmethod
     def _playlist_display_label(name: str, folder_map: dict) -> str:
@@ -1066,7 +1124,7 @@ class ITunesTkApp:
             playlist_name = self._playlist_raw_names[selection[0]]
             self._manual_playlist_view = True
             self.load_tracks(playlist_name)
-            self.last_action = f"トラック一覧表示: {playlist_name}"
+            self._log_action(f"トラック一覧表示: {playlist_name}")
         except Exception as e:
             logger.error("プレイリスト表示エラー: %s", e)
 
@@ -1093,7 +1151,7 @@ class ITunesTkApp:
             
             # トラック一覧の読み込み（バックグラウンド）
             self.load_tracks(playlist_name)
-            self.last_action = f"プレイリスト再生・選択: {playlist_name}"
+            self._log_action(f"プレイリスト再生・選択: {playlist_name}")
         except Exception as e:
             logger.error("プレイリスト選択エラー: %s", e)
     
@@ -1175,7 +1233,7 @@ class ITunesTkApp:
                 load_queue.put(batch)
 
         if not self._library_xml_exists:
-            self.last_action = "XML未設定/未検出のためトラック一覧を取得できません"
+            self._log_action("XML未設定/未検出のためトラック一覧を取得できません")
             self._show_error("ライブラリXMLが見つからないためトラック一覧を取得できません")
             return
 
@@ -1186,11 +1244,11 @@ class ITunesTkApp:
             with self._library_xml_lock:
                 pls = self._library_xml_playlists or []
             if not any((p.get('Name') == playlist_name) for p in pls if isinstance(p, dict)):
-                self.last_action = f"XMLにプレイリストがありません: {playlist_name}"
+                self._log_action(f"XMLにプレイリストがありません: {playlist_name}")
                 self._show_error(f"XMLにプレイリストがありません: {playlist_name}")
                 return
         else:
-            self.last_action = "ライブラリXML読込中..."
+            self._log_action("ライブラリXML読込中...")
 
         self._track_loading_thread = threading.Thread(
             target=self._stream_playlist_tracks_from_xml_worker,
@@ -1243,7 +1301,7 @@ class ITunesTkApp:
         # ワーカーからのエラーバッチ: トラック行ではなくエラー表示へ回す
         if tracks and isinstance(tracks[0], dict) and XML_ERROR_KEY in tracks[0]:
             msg = tracks[0].get(XML_ERROR_KEY) or "XML読込エラー"
-            self.last_action = msg
+            self._log_action(msg)
             try:
                 self._show_error(msg)
             except Exception:
@@ -1416,9 +1474,9 @@ class ITunesTkApp:
                     submitted = True
 
             if submitted:
-                self.last_action = f"トラック再生要求: {track_name or '-'}"
+                self._log_action(f"トラック再生要求: {track_name or '-'}")
             else:
-                self.last_action = "トラック再生失敗"
+                self._log_action("トラック再生失敗")
         except Exception as e:
             logger.error("トラック選択エラー: %s", e)
 
@@ -1740,7 +1798,7 @@ class ITunesTkApp:
             if not playlist_name:
                 playlist_name = self.ctrl.get_current_playlist_name()
             if not playlist_name:
-                self.last_action = "再生中のプレイリストがありません"
+                self._log_action("再生中のプレイリストがありません")
                 return
 
             # プレイリスト一覧から該当プレイリストを選択
@@ -1765,12 +1823,12 @@ class ITunesTkApp:
                                     self.track_tree.selection_set(item)
                                     self.track_tree.see(item)
                                     self.track_tree.focus(item)
-                                    self.last_action = f"再生中の曲へ移動: {playlist_name}"
+                                    self._log_action(f"再生中の曲へ移動: {playlist_name}")
                                     return
                             except Exception:
                                 pass
             
-            self.last_action = f"プレイリストへ移動: {playlist_name}"
+            self._log_action(f"プレイリストへ移動: {playlist_name}")
         except Exception as e:
             logger.error("再生中の曲へ移動エラー: %s", e)
 
@@ -1870,13 +1928,12 @@ class ITunesTkApp:
                 self.bpm_label.configure(text=f"BPM: {self.bpm_value:.1f}")
             else:
                 self.bpm_label.configure(text="BPM: -")
-            self.last_action_label.configure(text=f"最終アクション: {self.last_action}")
             self._update_loop_failures = 0
         except Exception as e:
             # 例外が起きてもループを停止させない。連続失敗時は指数バックオフ（上限付き）
             self._update_loop_failures = getattr(self, "_update_loop_failures", 0) + 1
             logger.error("UI更新ループエラー(%d回連続): %s", self._update_loop_failures, e)
-            self.last_action = f"UI更新エラー: {e}"
+            self._log_action(f"UI更新エラー: {e}")
             next_interval = min(
                 base_interval * (2 ** (self._update_loop_failures - 1)),
                 self.UPDATE_LOOP_MAX_INTERVAL_MS,
@@ -1901,15 +1958,15 @@ class ITunesTkApp:
                 avg = sum(intervals[-8:]) / min(len(intervals), 8)
                 bpm = 60.0 / avg
                 self.bpm_value = bpm
-                self.last_action = "Tap"
+                self._log_action("Tap")
         else:
             self.bpm_value = None
-            self.last_action = "Tap"
+            self._log_action("Tap")
 
     def reset_bpm(self):
         self.tap_times = []
         self.bpm_value = None
-        self.last_action = "BPMリセット"
+        self._log_action("BPMリセット")
 
 
 
