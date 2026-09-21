@@ -4,6 +4,8 @@
 - Linux/macOS 上に存在しない Windows COM モジュール (win32com, pythoncom) を stub 化
   ※ music_controller_windows は import 時にのみ必要。インスタンス化はしない
     （__init__ が iTunes COM へ接続するため）
+- Windows/TUI 依存モジュール (rich, keyboard, msvcrt) を stub 化
+  ※ tui_interface の import と __new__ + Mock 注入によるテストを可能にする
 """
 
 import sys
@@ -68,4 +70,54 @@ def _install_fake_tkinter() -> None:
     sys.modules["tkinter"] = tk
 
 
+def _install_fake_rich() -> None:
+    """rich サブモジュール群を sys.modules に登録する stub。
+
+    tui_interface は `from rich.console import Console` 等を行う。
+    各クラスは MagicMock で十分（context manager 等のマジックメソッドも使える）。
+    """
+    if "rich" in sys.modules:
+        return
+    rich = types.ModuleType("rich")
+    for sub, attrs in {
+        "console": ("Console",),
+        "layout": ("Layout",),
+        "panel": ("Panel",),
+        "text": ("Text",),
+        "live": ("Live",),
+        "table": ("Table",),
+        "align": ("Align",),
+    }.items():
+        mod = types.ModuleType(f"rich.{sub}")
+        for attr in attrs:
+            setattr(mod, attr, MagicMock(name=f"rich.{sub}.{attr}"))
+        setattr(rich, sub, mod)
+        sys.modules[f"rich.{sub}"] = mod
+    sys.modules["rich"] = rich
+
+
+def _install_fake_keyboard() -> None:
+    """keyboard モジュールの stub。グローバルフックは登録しない。"""
+    if "keyboard" in sys.modules:
+        return
+    keyboard = types.ModuleType("keyboard")
+    keyboard.on_press = MagicMock(name="keyboard.on_press")
+    keyboard.is_pressed = MagicMock(name="keyboard.is_pressed", return_value=False)
+    keyboard.unhook_all = MagicMock(name="keyboard.unhook_all")
+    sys.modules["keyboard"] = keyboard
+
+
+def _install_fake_msvcrt() -> None:
+    """msvcrt モジュールの stub。デフォルトはキー入力なし。"""
+    if "msvcrt" in sys.modules:
+        return
+    msvcrt = types.ModuleType("msvcrt")
+    msvcrt.kbhit = MagicMock(name="msvcrt.kbhit", return_value=False)
+    msvcrt.getwch = MagicMock(name="msvcrt.getwch")
+    sys.modules["msvcrt"] = msvcrt
+
+
 _install_fake_tkinter()
+_install_fake_rich()
+_install_fake_keyboard()
+_install_fake_msvcrt()
