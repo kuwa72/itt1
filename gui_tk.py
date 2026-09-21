@@ -4,6 +4,7 @@ from typing import List
 import logging
 import os
 import plistlib
+import sys
 import threading
 import time
 import queue
@@ -1520,12 +1521,37 @@ class ITunesTkApp:
 
 
 
-def run_gui():
-    cfg = ConfigManager("config.json")
+def run_gui(config: ConfigManager | None = None) -> int:
+    """GUIを起動する。終了コード(0=正常)を返す。
+
+    config: main() で生成した ConfigManager。省略時は従来通り config.json を読む。
+    コントローラー初期化（iTunes/Music への接続）に失敗した場合は、
+    案内メッセージを表示して非0を返す（未処理例外でトレースバックを出さない）。
+    """
+    cfg = config if config is not None else ConfigManager("config.json")
     root = tk.Tk()
-    app = ITunesTkApp(root, cfg)
+    try:
+        ITunesTkApp(root, cfg)
+    except Exception as e:
+        logger.exception("コントローラーの初期化に失敗しました")
+        message = (
+            "iTunes / Music に接続できませんでした。\n"
+            "iTunes / Music を起動してから、もう一度実行してください。\n\n"
+            f"詳細: {e}"
+        )
+        try:
+            messagebox.showerror("iTunes Controller", message, parent=root)
+        except Exception:
+            pass
+        print(f"エラー: {message}", file=sys.stderr)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return 1
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    run_gui()
+    sys.exit(run_gui())
