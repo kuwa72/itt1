@@ -300,8 +300,11 @@ class ITunesTkApp:
         self.progress_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 4))
         self.progress_bar = ttk.Scale(self.progress_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.on_progress_change)
         self.progress_bar.pack(fill=tk.X)
-        self.progress_bar.bind("<ButtonPress-1>", lambda e: setattr(self, '_seeking', True))
-        self.progress_bar.bind("<ButtonRelease-1>", lambda e: setattr(self, '_seeking', False))
+        # ttk.Scale のトラフクリックはデフォルトで「1ページ移動」するだけなので、
+        # Button-1/B1-Motion を自前ハンドラで潰し (break)、event.x の割合へジャンプさせる
+        self.progress_bar.bind("<ButtonPress-1>", self._on_progress_press)
+        self.progress_bar.bind("<B1-Motion>", self._on_progress_drag)
+        self.progress_bar.bind("<ButtonRelease-1>", self._on_progress_release)
 
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
@@ -1720,6 +1723,47 @@ class ITunesTkApp:
             except Exception:
                 pass
     
+    def _on_progress_press(self, event):
+        """シークバー上の Button-1。デフォルトのページ移動を抑制し、
+        クリック位置 (event.x / バー幅) の割合へジャンプする。"""
+        self._seeking = True
+        self._seek_to_event_x(event)
+        return "break"
+
+    def _on_progress_drag(self, event):
+        """B1-Motion 中もクリック位置基準で追従（デバウンス済みシーク）。
+        Button-1 で break 済みのためデフォルトのドラッグ状態は未初期化。
+        クラスバインド側の Drag も実行させないよう break を返す。"""
+        self._seek_to_event_x(event)
+        return "break"
+
+    def _on_progress_release(self, event):
+        """ボタン解放でドラッグ中フラグを落とす（進捗の自動追従を再開）"""
+        self._seeking = False
+
+    def _seek_to_event_x(self, event):
+        """event.x の割合 (0.0-1.0 にクリップ) に相当する値へスライダーを動かし、
+        on_progress_change 経由でデバウンスシークを発行する。
+        未レイアウト (幅0) や不正な座標では何もしない。"""
+        try:
+            width = int(self.progress_bar.winfo_width())
+        except Exception:
+            width = 0
+        if width <= 0:
+            return
+        try:
+            ratio = float(event.x) / width
+        except Exception:
+            return
+        value = max(0.0, min(1.0, ratio)) * 100.0
+        try:
+            self.progress_bar.set(value)
+        except Exception:
+            pass
+        # command= コールバックと同じ経路（_seeking ガード→デバウンス→COMワーカー）
+        # set() 自体も -command を発火するが同じ値のため無害
+        self.on_progress_change(value)
+
     def on_progress_change(self, value):
         """プログレスバー変更時。
 
