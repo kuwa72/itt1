@@ -92,6 +92,9 @@ class PlaylistPicker(tk.Toplevel):
 
 
 class ITunesTkApp:
+    # update_ui_loop 連続失敗時のバックオフ上限（ミリ秒）
+    UPDATE_LOOP_MAX_INTERVAL_MS = 30_000
+
     def __init__(self, root: tk.Tk, config: ConfigManager):
         self.root = root
         self.root.title("iTunes Controller (GUI)")
@@ -169,6 +172,9 @@ class ITunesTkApp:
         # 曲変更検知用
         self._synced_dbid: int | None = None
         self._synced_playlist: str | None = None
+
+        # update_ui_loop の連続失敗カウンタ（バックオフ用）
+        self._update_loop_failures = 0
 
         # UI
         self.build_ui()
@@ -444,51 +450,56 @@ class ITunesTkApp:
         self.last_action = f"バンク: {self.slot_bank + 1}"
 
     def on_key(self, event: tk.Event):
-        # 入力ボックス（Entry/Text）にフォーカスがある場合はホットキーを無効化
-        focus = self.root.focus_get()
-        if focus is not None and isinstance(focus, (tk.Entry, tk.Text, ttk.Entry, tk.Spinbox)):
-            return
+        try:
+            # 入力ボックス（Entry/Text）にフォーカスがある場合はホットキーを無効化
+            focus = self.root.focus_get()
+            if focus is not None and isinstance(focus, (tk.Entry, tk.Text, ttk.Entry, tk.Spinbox)):
+                return
 
-        k = self.normalize_key(event.keysym)
+            k = self.normalize_key(event.keysym)
 
-        # Ctrl+G is reserved for navigation
-        if k == 'g' and (event.state & 0x4):
-            self.goto_current_track(); return "break"
+            # Ctrl+G is reserved for navigation
+            if k == 'g' and (event.state & 0x4):
+                self.goto_current_track(); return "break"
 
-        is_ctrl = bool(event.state & 0x4)
-        eff_bank = 1 if is_ctrl else self.slot_bank
-        if k in self.slot_keys:
-            idx = eff_bank * self.bank_size + self.slot_keys.index(k)
-            self.add_to_slot(idx)
-            return "break"
-        if k == ',':
-            self.toggle_slot_bank(); return "break"
-        if k == '.':
-            self.toggle_slot_bank(); return "break"
-        if k == "space":
-            self.toggle_play_pause(); return "break"
-        if k == "Right":
-            self.skip_forward(); return "break"
-        if k == "Left":
-            self.skip_backward(); return "break"
-        if k == "Up":
-            self.prev_track(); return "break"
-        if k == "Down":
-            self.next_track(); return "break"
-        if k == "b":
-            self.pick_slots(); return "break"
-        if k == "v":
-            self.refresh_playlists(); return "break"
-        if k == "c":
-            self.create_single_playlist(); return "break"
-        if k == "/":
-            self.tap_bpm(); return "break"
-        if k == "x":
-            self.reset_bpm(); return "break"
-        if k == "m":
-            self.root.destroy(); return "break"
-        if k == "g" and (event.state & 0x4):  # Ctrl+G
-            self.goto_current_track(); return "break"
+            is_ctrl = bool(event.state & 0x4)
+            eff_bank = 1 if is_ctrl else self.slot_bank
+            if k in self.slot_keys:
+                idx = eff_bank * self.bank_size + self.slot_keys.index(k)
+                self.add_to_slot(idx)
+                return "break"
+            if k == ',':
+                self.toggle_slot_bank(); return "break"
+            if k == '.':
+                self.toggle_slot_bank(); return "break"
+            if k == "space":
+                self.toggle_play_pause(); return "break"
+            if k == "Right":
+                self.skip_forward(); return "break"
+            if k == "Left":
+                self.skip_backward(); return "break"
+            if k == "Up":
+                self.prev_track(); return "break"
+            if k == "Down":
+                self.next_track(); return "break"
+            if k == "b":
+                self.pick_slots(); return "break"
+            if k == "v":
+                self.refresh_playlists(); return "break"
+            if k == "c":
+                self.create_single_playlist(); return "break"
+            if k == "/":
+                self.tap_bpm(); return "break"
+            if k == "x":
+                self.reset_bpm(); return "break"
+            if k == "m":
+                self.root.destroy(); return "break"
+            if k == "g" and (event.state & 0x4):  # Ctrl+G
+                self.goto_current_track(); return "break"
+        except Exception as e:
+            # bind_all 経由のホットキー処理で例外が起きても Tk へ伝播させない
+            logger.error("キー入力処理エラー: %s", e)
+            self.last_action = f"キーエラー: {e}"
 
     # Actions
     def toggle_play_pause(self):
@@ -1307,41 +1318,62 @@ class ITunesTkApp:
             pass
 
     def update_ui_loop(self):
-        info = self.ctrl.get_current_track_info()
-        if info:
-            playing = info.get('is_playing', False)
-            self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
-            self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
-            self.track_artist.configure(text=f"アーティスト: {info.get('artist', '-')}")
-            self.track_album.configure(text=f"アルバム: {info.get('album', '-')}")
-            pos = int(info.get('position', 0) or 0)
-            dur = int(info.get('duration', 0) or 0)
-            pm, ps = divmod(pos, 60)
-            dm, ds = divmod(dur, 60)
-            self.track_time.configure(text=f"時間: {pm:02d}:{ps:02d} / {dm:02d}:{ds:02d}")
-            
-            # プログレスバー更新（ドラッグ中は更新しない）
-            if not self._seeking and dur > 0:
-                progress = (pos / dur) * 100
-                self.progress_bar.set(progress)
+        try:
+            base_interval = int(self.config.config.refresh_interval * 1000)
+        except Exception:
+            base_interval = 1000
+        next_interval = base_interval
+        try:
+            info = self.ctrl.get_current_track_info()
+            if info:
+                playing = info.get('is_playing', False)
+                self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
+                self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
+                self.track_artist.configure(text=f"アーティスト: {info.get('artist', '-')}")
+                self.track_album.configure(text=f"アルバム: {info.get('album', '-')}")
+                pos = int(info.get('position', 0) or 0)
+                dur = int(info.get('duration', 0) or 0)
+                pm, ps = divmod(pos, 60)
+                dm, ds = divmod(dur, 60)
+                self.track_time.configure(text=f"時間: {pm:02d}:{ps:02d} / {dm:02d}:{ds:02d}")
 
-            # 曲変更検知: dbid またはプレイリストが変わったら同期
-            cur_dbid = info.get('dbid')
-            cur_playlist = info.get('playlist')
-            if cur_dbid is not None and (
-                cur_dbid != self._synced_dbid or cur_playlist != self._synced_playlist
-            ):
-                self._synced_dbid = cur_dbid
-                self._synced_playlist = cur_playlist
-                self._on_track_changed(cur_playlist, cur_dbid)
+                # プログレスバー更新（ドラッグ中は更新しない）
+                if not self._seeking and dur > 0:
+                    progress = (pos / dur) * 100
+                    self.progress_bar.set(progress)
 
-        # BPM表示更新
-        if self.bpm_value:
-            self.bpm_label.configure(text=f"BPM: {self.bpm_value:.1f}")
-        else:
-            self.bpm_label.configure(text="BPM: -")
-        self.last_action_label.configure(text=f"最終アクション: {self.last_action}")
-        self.root.after(int(self.config.config.refresh_interval * 1000), self.update_ui_loop)
+                # 曲変更検知: dbid またはプレイリストが変わったら同期
+                cur_dbid = info.get('dbid')
+                cur_playlist = info.get('playlist')
+                if cur_dbid is not None and (
+                    cur_dbid != self._synced_dbid or cur_playlist != self._synced_playlist
+                ):
+                    self._synced_dbid = cur_dbid
+                    self._synced_playlist = cur_playlist
+                    self._on_track_changed(cur_playlist, cur_dbid)
+
+            # BPM表示更新
+            if self.bpm_value:
+                self.bpm_label.configure(text=f"BPM: {self.bpm_value:.1f}")
+            else:
+                self.bpm_label.configure(text="BPM: -")
+            self.last_action_label.configure(text=f"最終アクション: {self.last_action}")
+            self._update_loop_failures = 0
+        except Exception as e:
+            # 例外が起きてもループを停止させない。連続失敗時は指数バックオフ（上限付き）
+            self._update_loop_failures = getattr(self, "_update_loop_failures", 0) + 1
+            logger.error("UI更新ループエラー(%d回連続): %s", self._update_loop_failures, e)
+            self.last_action = f"UI更新エラー: {e}"
+            next_interval = min(
+                base_interval * (2 ** (self._update_loop_failures - 1)),
+                self.UPDATE_LOOP_MAX_INTERVAL_MS,
+            )
+        finally:
+            try:
+                self.root.after(next_interval, self.update_ui_loop)
+            except Exception:
+                # root 破棄後など再スケジュール自体が失敗した場合はループ終了
+                logger.debug("update_ui_loop の再スケジュールに失敗", exc_info=True)
 
     # BPM helpers
     def tap_bpm(self):
