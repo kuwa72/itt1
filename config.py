@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import platform
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 try:
     # pydantic v2
     from pydantic import ConfigDict  # type: ignore
@@ -57,7 +60,7 @@ class ConfigManager:
                     data = json.load(f)
                     return AppConfig(**data)
             except Exception as e:
-                print(f"設定ファイル読み込みエラー: {e}")
+                logger.error("設定ファイル読み込みエラー: %s", e)
                 return AppConfig()
         
         return AppConfig()
@@ -66,9 +69,9 @@ class ConfigManager:
         """設定をファイルに保存"""
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config.dict(), f, ensure_ascii=False, indent=2)
+                json.dump(self.config.model_dump(), f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"設定ファイル保存エラー: {e}")
+            logger.error("設定ファイル保存エラー: %s", e)
     
     def get_quick_slots(self) -> List[str]:
         """クイックスロットを取得（playlists フォールバックは廃止）。"""

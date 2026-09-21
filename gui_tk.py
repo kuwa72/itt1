@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import List
+import logging
 import os
 import plistlib
 import threading
@@ -8,6 +9,8 @@ import time
 import queue
 from music_controller_base import create_music_controller
 from config import ConfigManager
+
+logger = logging.getLogger(__name__)
 
 
 class PlaylistPicker(tk.Toplevel):
@@ -140,13 +143,6 @@ class ITunesTkApp:
         self.slot_keys: List[str] = list("1234567890-=") + list("qwertyuiop[]\\") + list("asdfghjkl;'")
         self.bank_size = len(self.slot_keys)
         self.slot_bank = 0
-        # For current track playlist display
-        self._last_track_sig: tuple | None = None
-        self._last_playlists_of_track: List[str] = []
-        self._fetching_track_playlists: bool = False
-        self._loading_indicator_after_id: int | None = None
-        self._warming_cache: bool = False
-        
         # 表示状態
         self.show_progress = tk.BooleanVar(value=True)
         self.show_playlists = tk.BooleanVar(value=True)
@@ -253,12 +249,6 @@ class ITunesTkApp:
         self.progress_bar.bind("<ButtonPress-1>", lambda e: setattr(self, '_seeking', True))
         self.progress_bar.bind("<ButtonRelease-1>", lambda e: setattr(self, '_seeking', False))
 
-        bottom_row = ttk.Frame(track_frame)
-        bottom_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
-        bottom_row.columnconfigure(0, weight=1)
-        self.track_in_playlists = ttk.Label(bottom_row, text="この曲の登録先: -", foreground="#666", font=("", 10))
-        self.track_in_playlists.grid(row=0, column=0, sticky="w")
-        
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
         self.middle_paned.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
@@ -643,7 +633,7 @@ class ITunesTkApp:
                 self._playlist_raw_names.append(name)
                 self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
         except Exception as e:
-            print(f"プレイリスト読み込みエラー: {e}")
+            logger.error("プレイリスト読み込みエラー: %s", e)
 
     def on_playlist_click(self, event):
         """シングルクリック: 再生せずに選択プレイリストのトラック一覧だけ表示する。
@@ -671,7 +661,7 @@ class ITunesTkApp:
             self.load_tracks(playlist_name)
             self.last_action = f"トラック一覧表示: {playlist_name}"
         except Exception as e:
-            print(f"プレイリスト表示エラー: {e}")
+            logger.error("プレイリスト表示エラー: %s", e)
 
     def on_playlist_select(self, event):
         """プレイリスト選択時（ダブルクリック/Enter: 再生してトラック一覧表示）"""
@@ -695,7 +685,7 @@ class ITunesTkApp:
             self.load_tracks(playlist_name)
             self.last_action = f"プレイリスト再生・選択: {playlist_name}"
         except Exception as e:
-            print(f"プレイリスト選択エラー: {e}")
+            logger.error("プレイリスト選択エラー: %s", e)
     
     def on_playlist_nav_up(self, event):
         """プレイリスト一覧で上キー"""
@@ -1004,7 +994,7 @@ class ITunesTkApp:
             else:
                 self.last_action = "トラック再生失敗"
         except Exception as e:
-            print(f"トラック選択エラー: {e}")
+            logger.error("トラック選択エラー: %s", e)
 
     def _load_library_xml_if_needed(self) -> bool:
         """ライブラリXMLを必要時に読み込み、キャッシュする。成功でTrue。"""
@@ -1238,12 +1228,12 @@ class ITunesTkApp:
                                     self.track_tree.focus(item)
                                     self.last_action = f"再生中の曲へ移動: {playlist_name}"
                                     return
-                            except:
+                            except Exception:
                                 pass
             
             self.last_action = f"プレイリストへ移動: {playlist_name}"
         except Exception as e:
-            print(f"再生中の曲へ移動エラー: {e}")
+            logger.error("再生中の曲へ移動エラー: %s", e)
 
     def _sync_to_itunes_state(self):
         """iTunesの現在の再生状態をUIに反映する（起動直後用）"""
@@ -1259,7 +1249,7 @@ class ITunesTkApp:
             self._synced_playlist = cur_playlist
             self._on_track_changed(cur_playlist, cur_dbid)
         except Exception as e:
-            print(f"起動時同期エラー: {e}")
+            logger.error("起動時同期エラー: %s", e)
 
     def _on_track_changed(self, playlist_name: str | None, dbid: int | None):
         """曲が変わったときにUIのプレイリスト選択とトラックハイライトを更新する"""

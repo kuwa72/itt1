@@ -5,7 +5,6 @@ WindowsのiTunesをワンキー操作で制御し、プレイリストを効率�
 """
 
 import sys
-import os
 import argparse
 from pathlib import Path
 
@@ -29,15 +28,6 @@ def main():
     
     # GUIのみ提供
     run_gui()
-
-
-def run_app_gui_only(config_manager):
-    """GUIのみを起動"""
-    try:
-        run_gui()
-    except Exception as e:
-        print(f"エラーが発生しました: {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":
