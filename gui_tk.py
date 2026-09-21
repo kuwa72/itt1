@@ -170,10 +170,9 @@ class ITunesTkApp:
         self.slot_bank = 0
         # 表示状態
         self.show_progress = tk.BooleanVar(value=True)
-        self.show_playlists = tk.BooleanVar(value=True)
-        self.show_tracks = tk.BooleanVar(value=True)
-        self.show_bpm = tk.BooleanVar(value=True)
         self.show_slots = tk.BooleanVar(value=True)
+        self.show_log = tk.BooleanVar(value=True)
+        self.help_visible = tk.BooleanVar(value=True)
         
         # プログレスバーのドラッグ中フラグ
         self._seeking = False
@@ -249,10 +248,9 @@ class ITunesTkApp:
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="表示", menu=view_menu)
         view_menu.add_checkbutton(label="プログレスバー", variable=self.show_progress, command=self.toggle_progress)
-        view_menu.add_checkbutton(label="プレイリスト一覧", variable=self.show_playlists, command=self.toggle_playlists)
-        view_menu.add_checkbutton(label="トラック一覧", variable=self.show_tracks, command=self.toggle_tracks)
-        view_menu.add_checkbutton(label="BPMパネル", variable=self.show_bpm, command=self.toggle_bpm)
         view_menu.add_checkbutton(label="クイックスロット", variable=self.show_slots, command=self.toggle_slots)
+        view_menu.add_checkbutton(label="ログ", variable=self.show_log, command=self.toggle_log)
+        view_menu.add_checkbutton(label="ヘルプ", variable=self.help_visible, command=self.toggle_help)
         
         nav_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="移動", menu=nav_menu)
@@ -440,17 +438,6 @@ class ITunesTkApp:
         help_frame = ttk.LabelFrame(container, text="操作")
         help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
         
-        help_header = ttk.Frame(help_frame)
-        help_header.pack(fill=tk.X, padx=6, pady=4)
-        self.help_visible = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            help_header,
-            text="ヘルプ表示",
-            variable=self.help_visible,
-            command=self.toggle_help,
-            takefocus=False
-        ).pack(side=tk.LEFT)
-        
         help_text = (
             "Space再生/停止 ←→スキップ ↑↓曲送り  "
             "上3段キーでスロット追加  Ctrl+上3段:バンク2  ,/.:バンク固定切替  "
@@ -458,9 +445,7 @@ class ITunesTkApp:
         )
         self.help_label = ttk.Label(help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
         self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
-        
-        # 初期状態で非表示にする場合は以下をコメントアウトし、self.help_visible = tk.BooleanVar(value=False) に変更
-        # self.help_label.pack_forget()
+        # 表示/非表示は「表示」メニューの「ヘルプ」トグル（toggle_help）で切り替える
 
     def bind_keys(self):
         self.root.bind_all("<KeyPress>", self.on_key)
@@ -1783,33 +1768,17 @@ class ITunesTkApp:
         else:
             self.progress_frame.grid_remove()
     
-    def toggle_playlists(self):
-        if self.show_playlists.get():
-            if self.playlist_frame not in self.middle_paned.panes():
-                self.middle_paned.add(self.playlist_frame, weight=1)
-        else:
-            if self.playlist_frame in self.middle_paned.panes():
-                self.middle_paned.remove(self.playlist_frame)
-    
-    def toggle_tracks(self):
-        if self.show_tracks.get():
-            if self.track_frame_list not in self.middle_paned.panes():
-                self.middle_paned.add(self.track_frame_list, weight=2)
-        else:
-            if self.track_frame_list in self.middle_paned.panes():
-                self.middle_paned.remove(self.track_frame_list)
-    
-    def toggle_bpm(self):
-        if self.show_bpm.get():
-            self.bpm_frame.grid(row=0, column=1, sticky="e", padx=8, pady=(6, 2))
-        else:
-            self.bpm_frame.grid_remove()
-    
     def toggle_slots(self):
         if self.show_slots.get():
             self.slots_frame.pack(fill=tk.X, pady=(10, 0))
         else:
             self.slots_frame.pack_forget()
+
+    def toggle_log(self):
+        if self.show_log.get():
+            self.action_log_frame.pack(fill=tk.X, pady=(6, 0))
+        else:
+            self.action_log_frame.pack_forget()
     
     def goto_current_track(self):
         """現在再生中のプレイリストとトラックに移動"""
