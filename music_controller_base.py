@@ -94,10 +94,12 @@ class MacOSMusicController:
     def play_pause(self):
         self._run_applescript('tell application "Music" to playpause')
 
-    def play_next_track(self):
+    def play_next_track(self, playlist_name: str | None = None):
+        # playlist_name は Windows 版との API 互換用（gui_tk が再生コンテキストを渡す）。
+        # macOS 側は Music アプリの next track がプレイリストコンテキストを維持するため未使用。
         self._run_applescript('tell application "Music" to next track')
 
-    def play_previous_track(self):
+    def play_previous_track(self, playlist_name: str | None = None):
         self._run_applescript('tell application "Music" to previous track')
 
     def set_position(self, seconds: float) -> None:
