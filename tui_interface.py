@@ -8,10 +8,11 @@ from rich.align import Align
 import keyboard
 import msvcrt
 import queue
+import sys
 import threading
 import time
 from typing import List, Dict, Any
-from itunes_controller import iTunesController
+from music_controller_base import create_music_controller
 from config import ConfigManager
 
 
@@ -20,7 +21,7 @@ class iTunesTUI:
     
     def __init__(self, config_manager: ConfigManager = None, use_global_hook: bool = True):
         self.console = Console()
-        self.itunes = iTunesController()
+        self.itunes = create_music_controller()
         self.config_manager = config_manager or ConfigManager()
         self.use_global_hook = use_global_hook
         self.running = True
@@ -100,10 +101,13 @@ class iTunesTUI:
         if not playlist_name:
             self.last_action = "未設定スロット"
             return
-        success = self.itunes.add_to_playlist(playlist_name)
-        if success:
+        result = self.itunes.add_to_playlist(playlist_name)
+        if result == "added":
             self.console.print(f"[green]✓ {playlist_name}に追加しました[/green]")
             self.last_action = f"追加: {playlist_name}"
+        elif result == "already_exists":
+            self.console.print(f"[yellow]✓ {playlist_name}には既に存在します[/yellow]")
+            self.last_action = f"既に存在: {playlist_name}"
         else:
             self.console.print(f"[red]✗ 追加に失敗しました: {playlist_name}[/red]")
             self.last_action = f"追加失敗: {playlist_name}"
@@ -400,6 +404,21 @@ class iTunesTUI:
             self.console.print("[yellow]iTunes Controller を終了しました[/yellow]")
 
 
-if __name__ == "__main__":
-    tui = iTunesTUI()
+def main() -> None:
+    """TUI エントリポイント。
+
+    起動時に iTunes/Music へ接続できない場合はメッセージを表示して正常終了する。
+    """
+    try:
+        tui = iTunesTUI()
+    except Exception as e:
+        print(
+            f"iTunes/Music に接続できませんでした。アプリを起動してから再実行してください: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(0)
     tui.run()
+
+
+if __name__ == "__main__":
+    main()

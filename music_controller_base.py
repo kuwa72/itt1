@@ -164,9 +164,21 @@ class MacOSMusicController:
         '''
         try:
             result = self._run_applescript(script)
-            return result in ["added", "already_exists"]
+            if result in ("added", "already_exists"):
+                return result
+            return False
         except RuntimeError:
             return False
+
+    def get_current_playlist_name(self) -> str | None:
+        """現在再生中のプレイリスト名を返す。未再生/取得不可の場合は None"""
+        try:
+            name = self._run_applescript(
+                'tell application "Music" to get name of current playlist'
+            )
+            return name or None
+        except RuntimeError:
+            return None
 
     def set_current_track_bpm(self, bpm: int) -> bool:
         """Set BPM for current track"""

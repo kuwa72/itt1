@@ -89,7 +89,21 @@ class WindowsMusicController:
         except Exception as e:
             logger.error("トラック情報取得エラー: %s", e)
             return {}
-    
+
+    def get_current_playlist_name(self) -> str | None:
+        """現在再生中のプレイリスト名を返す。未再生/取得不可の場合は None"""
+        if not self.itunes:
+            return None
+        try:
+            current_playlist = getattr(self.itunes, 'CurrentPlaylist', None)
+            if current_playlist is None:
+                return None
+            name = getattr(current_playlist, 'Name', None)
+            return name or None
+        except Exception as e:
+            logger.error("現在のプレイリスト名取得エラー: %s", e)
+            return None
+
     def play_pause(self):
         """再生/一時停止を切り替える"""
         if not self.itunes:

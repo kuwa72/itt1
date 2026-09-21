@@ -15,7 +15,6 @@ TRACKED_PY = [
     "main.py",
     "config.py",
     "gui_tk.py",
-    "itunes_controller.py",
     "music_controller_base.py",
     "music_controller_windows.py",
     "tui_interface.py",

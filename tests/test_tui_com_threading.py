@@ -4,34 +4,27 @@ keyboard グローバルフックのコールバックと msvcrt ポーリング
 キーイベントを queue に積むだけにし、COM 操作を伴う handle_key_press は
 メインスレッド (= self.itunes を生成した STA) の run() ループで処理する。
 
-あわせて itunes_controller の _last_result_* キャッシュが _cache_lock 配下で
-読み書きされることを検証する。
+itunes_controller は Issue #7 で共通コントローラー (create_music_controller) に
+統合され削除済みのため、旧 _last_result_* キャッシュのロック検証テストも削除した。
 
 rich / keyboard / msvcrt / win32com / pythoncom は conftest.py の stub 経由。
 """
 
-import ast
-import inspect
 import queue
-import textwrap
-import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-import itunes_controller
 import tui_interface
-from itunes_controller import iTunesController
 from tui_interface import iTunesTUI
 
 
 @pytest.fixture
 def tui() -> iTunesTUI:
-    """iTunesController/ConfigManager を差し替えて実際の __init__ を通す。"""
+    """共通コントローラー/ConfigManager を差し替えて実際の __init__ を通す。"""
     with patch.object(
-        tui_interface, "iTunesController", MagicMock(name="iTunesController")
+        tui_interface, "create_music_controller", MagicMock(name="create_music_controller")
     ), patch.object(tui_interface, "ConfigManager") as cm_cls:
         cm = cm_cls.return_value
         cm.get_quick_slots.return_value = []
@@ -218,126 +211,3 @@ def test_run_passes_local_key_reader_to_thread(tui):
         "target", thread_cls.call_args.args[0] if thread_cls.call_args.args else None
     )
     assert target == tui._local_key_reader
-
-
-# --- itunes_controller: _last_result_* のロック保護 ---
-
-def _make_controller() -> iTunesController:
-    ctrl = iTunesController.__new__(iTunesController)
-    ctrl.itunes = MagicMock(name="itunes")
-    ctrl.current_track = None
-    ctrl._last_result_sig = None
-    ctrl._last_result_names = []
-    ctrl._last_result_time = 0.0
-    ctrl._playlist_dbid_cache = {}
-    ctrl._cache_ttl_sec = 300.0
-    ctrl._cache_lock = threading.Lock()
-    ctrl._recent_sig_cache = {}
-    ctrl._recent_sig_ttl_sec = 300.0
-    return ctrl
-
-
-class _RecordingLock:
-    """with 経由の acquire 回数を記録するロックラッパー。"""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.enter_count = 0
-
-    def __enter__(self):
-        self.enter_count += 1
-        return self._lock.__enter__()
-
-    def __exit__(self, *args):
-        return self._lock.__exit__(*args)
-
-    def acquire(self, *args, **kwargs):
-        return self._lock.acquire(*args, **kwargs)
-
-    def release(self):
-        return self._lock.release()
-
-
-def test_last_result_cache_access_is_inside_cache_lock():
-    """get_playlists_of_current_track_threadsafe 内の self._last_result_* アクセスは
-    すべて `with self._cache_lock:` ブロック内にあること（構造チェック）"""
-    src = textwrap.dedent(
-        inspect.getsource(iTunesController.get_playlists_of_current_track_threadsafe)
-    )
-    tree = ast.parse(src)
-
-    locked_ranges = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.With):
-            continue
-        for item in node.items:
-            expr = item.context_expr
-            if (
-                isinstance(expr, ast.Attribute)
-                and expr.attr == "_cache_lock"
-                and isinstance(expr.value, ast.Name)
-                and expr.value.id == "self"
-            ):
-                locked_ranges.append((node.body[0].lineno, node.body[-1].end_lineno))
-
-    accesses = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr.startswith("_last_result_")
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
-    ]
-    assert accesses, "self._last_result_* アクセスが見つからない"
-    for node in accesses:
-        assert any(lo <= node.lineno <= hi for lo, hi in locked_ranges), (
-            f"line {node.lineno}: self.{node.attr} が _cache_lock 外でアクセスされている"
-        )
-
-
-def _fake_itunes_for_threadsafe(track=None, source_count=0):
-    it = SimpleNamespace(CurrentTrack=track)
-    if track is not None:
-        it.Sources = SimpleNamespace(Count=source_count)
-    return it
-
-
-_TRACK = SimpleNamespace(
-    TrackDatabaseID=1, Name="n", Artist="a", Album="b", Duration=100
-)
-
-
-def test_last_result_read_is_under_lock():
-    """キャッシュヒット時の _last_result_* 読み取りがロック取得を伴う"""
-    ctrl = _make_controller()
-    lock = _RecordingLock()
-    ctrl._cache_lock = lock
-    sig = ("n", "a", "b", 100)
-    ctrl._last_result_sig = sig
-    ctrl._last_result_names = ["P1"]
-    ctrl._last_result_time = time.time()
-
-    it = _fake_itunes_for_threadsafe(track=_TRACK)
-    with patch.object(itunes_controller.win32com.client, "Dispatch", return_value=it):
-        result = ctrl.get_playlists_of_current_track_threadsafe()
-
-    assert result == ["P1"]
-    assert lock.enter_count >= 1
-
-
-def test_last_result_write_is_under_lock():
-    """キャッシュミス時の _last_result_* 書き込みがロック取得を伴う"""
-    ctrl = _make_controller()
-    lock = _RecordingLock()
-    ctrl._cache_lock = lock
-
-    it = _fake_itunes_for_threadsafe(track=_TRACK, source_count=0)
-    with patch.object(itunes_controller.win32com.client, "Dispatch", return_value=it):
-        result = ctrl.get_playlists_of_current_track_threadsafe()
-
-    assert result == []
-    assert ctrl._last_result_sig == ("n", "a", "b", 100)
-    assert ctrl._last_result_names == []
-    # read 判定 + recent_sig 参照 + write で計3回の acquire を期待
-    # (修正前は recent_sig の1回のみ)
-    assert lock.enter_count >= 3
