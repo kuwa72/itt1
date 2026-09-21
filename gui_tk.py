@@ -162,6 +162,8 @@ class ITunesTkApp:
         self._track_loading_queue: "queue.Queue[list[dict]] | None" = None
         self._track_loading_playlist: str | None = None
         self._track_loading_dbid: int | None = None
+        # 読み込み世代番号（load_tracks ごとにインクリメント。ワーカー/キュー/ポーラーを世代に紐付ける）
+        self._track_load_generation: int = 0
         # 手動選択による表示中は再生中プレイリストへの自動追従を抑止するフラグ
         self._manual_playlist_view: bool = False
         # シングルクリック表示の遅延実行ID（ダブルクリックとの競合回避用）
@@ -742,15 +744,20 @@ class ITunesTkApp:
     
     def load_tracks(self, playlist_name: str):
         """トラック一覧をバックグラウンドCOMワーカー経由でプログレッシブに読み込む"""
-        # 既存ワーカーをキャンセル
+        # 既存ワーカーをキャンセル（joinはしない。旧ワーカーはcancel_eventを見て自然終了し、
+        # 残りのバッチは旧世代のキューにのみ届くため新世代へ混入しない）
         if self._track_loading_cancel_event is not None:
             self._track_loading_cancel_event.set()
-        if self._track_loading_thread is not None and self._track_loading_thread.is_alive():
-            self._track_loading_thread.join(timeout=0.2)
+
+        # 新しい世代を開始
+        self._track_load_generation += 1
+        generation = self._track_load_generation
 
         # 状態を初期化
-        self._track_loading_queue = queue.Queue()
-        self._track_loading_cancel_event = threading.Event()
+        load_queue: "queue.Queue[list[dict]]" = queue.Queue()
+        cancel_event = threading.Event()
+        self._track_loading_queue = load_queue
+        self._track_loading_cancel_event = cancel_event
         self._track_loading_playlist = playlist_name
 
         info = self.ctrl.get_current_track_info()
@@ -763,10 +770,11 @@ class ITunesTkApp:
         except Exception:
             pass
 
-        # ワーカー起動（Tkに触らない）
+        # ワーカー起動（Tkに触らない）。キューとキャンセルイベントはこの世代のものを
+        # クロージャで捕捉し、新世代に上書きされるインスタンス属性は遅延参照しない
         def _on_batch(batch: list[dict]) -> None:
-            if self._track_loading_queue is not None:
-                self._track_loading_queue.put(batch)
+            if not cancel_event.is_set():
+                load_queue.put(batch)
 
         if not self._library_xml_exists:
             self.last_action = "XML未設定/未検出のためトラック一覧を取得できません"
@@ -801,17 +809,22 @@ class ITunesTkApp:
 
         self._track_loading_thread = threading.Thread(
             target=self._stream_playlist_tracks_from_xml_worker,
-            args=(playlist_name, 50, _on_batch, self._track_loading_cancel_event),
+            args=(playlist_name, 50, _on_batch, cancel_event),
             daemon=True,
         )
         self._track_loading_thread.start()
 
-        # キューポーリング開始
-        self._poll_track_queue()
+        # キューポーリング開始（世代ごとに1系統。旧世代のポーラーは次回発火時に終了する）
+        self._poll_track_queue(generation)
 
-    def _poll_track_queue(self):
+    def _poll_track_queue(self, generation: int):
         """バックグラウンドワーカーから届いたトラックバッチをUIに反映"""
+        # 自分の世代ではなくなったポーラーは即終了（新キューを読まない・再スケジュールしない）
+        if generation != self._track_load_generation:
+            return
+
         q = self._track_loading_queue
+        cancel_event = self._track_loading_cancel_event
         if q is None:
             return
 
@@ -821,7 +834,7 @@ class ITunesTkApp:
         try:
             while processed < max_batches_per_tick:
                 batch = q.get_nowait()
-                self._display_tracks_batch_sync(batch, self._track_loading_dbid)
+                self._display_tracks_batch_sync(batch, self._track_loading_dbid, cancel_event)
                 processed += 1
         except queue.Empty:
             pass
@@ -830,26 +843,23 @@ class ITunesTkApp:
         worker_alive = (
             self._track_loading_thread is not None
             and self._track_loading_thread.is_alive()
-            and self._track_loading_cancel_event is not None
-            and not self._track_loading_cancel_event.is_set()
+            and cancel_event is not None
+            and not cancel_event.is_set()
         )
         if worker_alive or (not q.empty()):
-            self.root.after(30, self._poll_track_queue)
+            self.root.after(30, self._poll_track_queue, generation)
         else:
             # ワーカー完了: 保存されたdbidでトラックをハイライト
             if self._track_loading_dbid is not None:
                 self._highlight_track_by_dbid(self._track_loading_dbid)
 
-    def _display_tracks_batch_sync(self, tracks, current_dbid):
-        """トラックのバッチをUIに表示（同期実行）"""
+    def _display_tracks_batch_sync(self, tracks, current_dbid, cancel_event=None):
+        """トラックのバッチをUIに表示（同期実行）。cancel_eventは呼出し世代のものを渡す"""
         # PlayOrderIndex順にソート
         tracks.sort(key=lambda x: x.get('play_order', 0))
-        
+
         for track in tracks:
-            if (
-                self._track_loading_cancel_event is not None
-                and self._track_loading_cancel_event.is_set()
-            ):
+            if cancel_event is not None and cancel_event.is_set():
                 return
             
             duration = track.get('duration', 0)
