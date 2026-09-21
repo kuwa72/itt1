@@ -25,9 +25,14 @@ def main():
     
     # 設定マネージャーを初期化
     config_manager = ConfigManager(args.config)
-    
+
     # GUIのみ提供
-    run_gui()
+    try:
+        exit_code = run_gui(config_manager)
+    except Exception as e:
+        print(f"エラー: アプリケーションの起動に失敗しました: {e}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
