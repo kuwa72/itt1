@@ -27,6 +27,8 @@ COMMON_REQUIRED_METHODS = [
     "add_to_playlist",
     "create_playlist",
     "set_current_track_bpm",
+    "get_volume",
+    "set_volume",
 ]
 
 # gui_tk が呼ぶが現状 Windows 側にのみ実装があるメソッド

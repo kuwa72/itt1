@@ -106,6 +106,30 @@ class MacOSMusicController:
         script = f'tell application "Music" to set player position to {seconds}'
         self._run_applescript(script)
 
+    def get_volume(self) -> int | None:
+        """現在の音量 (0-100) を返す。取得失敗時は None"""
+        try:
+            result = self._run_applescript(
+                'tell application "Music" to get sound volume'
+            )
+            return int(result)
+        except (RuntimeError, ValueError):
+            return None
+
+    def set_volume(self, level: int) -> bool:
+        """音量 (0-100) を設定する。範囲外はクリップ、失敗時は False"""
+        try:
+            level = max(0, min(100, int(level)))
+        except (TypeError, ValueError):
+            return False
+        try:
+            self._run_applescript(
+                f'tell application "Music" to set sound volume to {level}'
+            )
+            return True
+        except RuntimeError:
+            return False
+
     def skip_forward(self, seconds: int = 10):
         info = self.get_current_track_info() or {}
         pos = int(info.get('position') or 0) + int(seconds)
