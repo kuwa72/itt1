@@ -169,7 +169,6 @@ class ITunesTkApp:
         self.bank_size = len(self.slot_keys)
         self.slot_bank = 0
         # 表示状態
-        self.show_progress = tk.BooleanVar(value=True)
         self.show_slots = tk.BooleanVar(value=True)
         self.show_log = tk.BooleanVar(value=True)
         self.help_visible = tk.BooleanVar(value=True)
@@ -251,7 +250,6 @@ class ITunesTkApp:
         
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="表示", menu=view_menu)
-        view_menu.add_checkbutton(label="プログレスバー", variable=self.show_progress, command=self.toggle_progress)
         view_menu.add_checkbutton(label="クイックスロット", variable=self.show_slots, command=self.toggle_slots)
         view_menu.add_checkbutton(label="ログ", variable=self.show_log, command=self.toggle_log)
         view_menu.add_checkbutton(label="ヘルプ", variable=self.help_visible, command=self.toggle_help)
@@ -473,15 +471,15 @@ class ITunesTkApp:
         self.load_playlists()
 
         # Help
-        help_frame = ttk.LabelFrame(container, text="操作")
-        help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
+        self.help_frame = ttk.LabelFrame(container, text="操作")
+        self.help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
         
         help_text = (
             "Space再生/停止 ←→スキップ ↑↓曲送り  "
             "上3段キーでスロット追加  Ctrl+上3段:バンク2  ,/.:バンク固定切替  "
             "b:スロット割当  v:プレイリスト一覧更新  c:プレイリスト作成"
         )
-        self.help_label = ttk.Label(help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
+        self.help_label = ttk.Label(self.help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
         self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
         # 表示/非表示は「表示」メニューの「ヘルプ」トグル（toggle_help）で切り替える
 
@@ -871,11 +869,11 @@ class ITunesTkApp:
             pass
 
     def toggle_help(self):
-        """ヘルプ表示のトグル"""
+        """ヘルプ表示のトグル（LabelFrame ごと切替。空枠が残らないよう toggle_log と同じ挙動）"""
         if self.help_visible.get():
-            self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
+            self.help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
         else:
-            self.help_label.pack_forget()
+            self.help_frame.pack_forget()
 
     def normalize_key(self, keysym: str) -> str:
         k = (keysym or "").lower()
@@ -1946,12 +1944,6 @@ class ITunesTkApp:
         self._com_submit("set_volume", level)
 
     # トグルメソッド
-    def toggle_progress(self):
-        if self.show_progress.get():
-            self.progress_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 4))
-        else:
-            self.progress_frame.grid_remove()
-    
     def toggle_slots(self):
         if self.show_slots.get():
             self.slots_frame.pack(fill=tk.X, pady=(10, 0))

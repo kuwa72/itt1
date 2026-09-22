@@ -1,10 +1,13 @@
-"""Issue #23: 「表示」メニューのトグル整理テスト。
+"""Issue #23 / #31: 「表示」メニューのトグル整理テスト。
 
 - 削除: プレイリスト一覧 / トラック一覧 / BPMパネルのチェックボタンと
   対応する BooleanVar / toggle メソッド（panes() 比較バグで機能していない死にコード）
 - 削除: 画面内の「ヘルプ表示」チェックボタンと help_header フレーム
 - 集約: 「表示」メニューに ヘルプ（既存 help_visible / toggle_help を流用）と
   ログ（新設 show_log / toggle_log で action_log_frame を pack/pack_forget 切替）
+- Issue #31: 「プログレスバー」チェックボタンと show_progress / toggle_progress を削除
+  （プログレスバーは常時表示）。toggle_help は help_label ではなく
+  help_frame（LabelFrame 全体）を pack/pack_forget するよう統一
 """
 
 import ast
@@ -55,9 +58,8 @@ def _init_self_attrs() -> set[str]:
 # --- 「表示」メニュー最終構成 ---
 
 def test_view_menu_items_in_order():
-    """「表示」メニューは プログレスバー/クイックスロット/ログ/ヘルプ の順"""
+    """「表示」メニューは クイックスロット/ログ/ヘルプ の順"""
     assert _view_menu_checkbutton_labels() == [
-        "プログレスバー",
         "クイックスロット",
         "ログ",
         "ヘルプ",
@@ -67,7 +69,7 @@ def test_view_menu_items_in_order():
 def test_view_menu_removed_items_absent():
     """削除対象のチェックボタンがメニューに残っていない"""
     labels = _view_menu_checkbutton_labels()
-    for removed in ("プレイリスト一覧", "トラック一覧", "BPMパネル"):
+    for removed in ("プログレスバー", "プレイリスト一覧", "トラック一覧", "BPMパネル"):
         assert removed not in labels
 
 
@@ -105,6 +107,8 @@ def test_view_menu_log_uses_show_log_and_toggle_log():
         "toggle_tracks",
         "toggle_bpm",
         "help_header",
+        "show_progress",
+        "toggle_progress",
     ],
 )
 def test_dead_code_removed(name):
@@ -144,3 +148,35 @@ def test_toggle_log_hides_frame_when_off():
     app.toggle_log()
     app.action_log_frame.pack_forget.assert_called_once()
     app.action_log_frame.pack.assert_not_called()
+
+
+# --- toggle_help の振る舞い（Issue #31: help_frame 全体を切替） ---
+
+def _make_app_for_help(help_visible_value: bool) -> ITunesTkApp:
+    app = ITunesTkApp.__new__(ITunesTkApp)
+    app.help_visible = MagicMock(name="help_visible")
+    app.help_visible.get.return_value = help_visible_value
+    app.help_frame = MagicMock(name="help_frame")
+    app.help_label = MagicMock(name="help_label")
+    return app
+
+
+def test_toggle_help_shows_frame_when_on():
+    """ON 時は help_frame（枠ごと）を build_ui と同じ引数で pack する"""
+    app = _make_app_for_help(True)
+    app.toggle_help()
+    app.help_frame.pack.assert_called_once()
+    app.help_frame.pack_forget.assert_not_called()
+    # 中身のラベルではなく枠を切り替える（空の LabelFrame が残らない）
+    app.help_label.pack.assert_not_called()
+    app.help_label.pack_forget.assert_not_called()
+
+
+def test_toggle_help_hides_frame_when_off():
+    """OFF 時は help_frame ごと pack_forget する"""
+    app = _make_app_for_help(False)
+    app.toggle_help()
+    app.help_frame.pack_forget.assert_called_once()
+    app.help_frame.pack.assert_not_called()
+    app.help_label.pack.assert_not_called()
+    app.help_label.pack_forget.assert_not_called()
