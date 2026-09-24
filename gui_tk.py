@@ -203,6 +203,10 @@ class ITunesTkApp:
         # 再生コンテキストのプレイリスト名（次/前曲遷移でプレイリスト内隣接曲へ進むための情報。
         # play_track_by_ids / play_playlist の成功時に _handle_task_result で更新される）
         self._playback_playlist: str | None = None
+        # 自然終了検知（Issue #37）: 直前ポーリング状態と手動遷移の帳簿
+        self._prev_track_info: dict | None = None
+        self._expected_dbid: int | None = None
+        self._suppress_track_correction: bool = False
 
         # update_ui_loop の連続失敗カウンタ（バックオフ用）
         self._update_loop_failures = 0
@@ -778,6 +782,7 @@ class ITunesTkApp:
 
     def _apply_track_info(self, info):
         """ポーリング済みのトラック情報をウィジェットへ反映（UIスレッド。COM不使用）"""
+        self._handle_track_transition(info or {})
         if not info:
             return
         # 音量はポーリング値へ追従するが、ドラッグ中はユーザー操作を優先して上書きしない
@@ -815,6 +820,71 @@ class ITunesTkApp:
             self._synced_dbid = cur_dbid
             self._synced_playlist = cur_playlist
             self._on_track_changed(cur_playlist, cur_dbid)
+
+    def _handle_track_transition(self, info: dict):
+        """自然終了時にトラック一覧の次の行を再生する（Issue #37）。
+
+        直前ポーリングが「再生中かつ末尾2秒以内」のとき:
+        - iTunes が別の曲に進んだ → 一覧の次の行と一致しなければ補正して再生
+        - 再生が止まった（キュー枯渇）→ 一覧の次の行を再生
+        手動遷移（次/前・ダブルクリック・フォールバック）は _expected_dbid /
+        _suppress_track_correction で補正対象外とする。
+        """
+        prev = getattr(self, "_prev_track_info", None)
+        self._prev_track_info = info
+        if not isinstance(prev, dict) or not isinstance(info, dict):
+            return
+        prev_dbid = prev.get("dbid")
+        if prev_dbid is None:
+            return
+        cur_dbid = info.get("dbid")
+
+        ended = bool(prev.get("is_playing")) and (
+            (prev.get("duration") or 0) - (prev.get("position") or 0) <= 2
+        )
+        changed = cur_dbid is not None and cur_dbid != prev_dbid
+        stopped_at_end = (
+            (cur_dbid is None or cur_dbid == prev_dbid)
+            and prev.get("is_playing")
+            and not info.get("is_playing")
+        )
+
+        if changed:
+            if getattr(self, "_suppress_track_correction", False):
+                self._suppress_track_correction = False
+                return
+            expected = getattr(self, "_expected_dbid", None)
+            if expected is not None:
+                self._expected_dbid = None
+                if cur_dbid == expected:
+                    return
+            if not ended:
+                # 途中での曲変更 = iTunes 側の手動操作等 → 追従（補正しない）
+                return
+            self._play_next_in_list_after(prev_dbid, cur_dbid)
+        elif stopped_at_end and ended:
+            self._play_next_in_list_after(prev_dbid, None)
+
+    def _play_next_in_list_after(self, ended_dbid, current_dbid=None) -> bool:
+        """自然終了した曲の一覧上の次の行を再生する。
+        iTunes が既にその曲へ進んでいる場合は何もせず True。
+        一覧に無い/末尾の場合は False（何もしない）。"""
+        try:
+            if getattr(self, "_com_task_queue", None) is None:
+                return False
+            items = list(self.track_tree.get_children(''))
+            for pos, iid in enumerate(items):
+                if self._item_dbid(iid) == ended_dbid:
+                    nxt = pos + 1
+                    if nxt >= len(items):
+                        return False
+                    if current_dbid is not None and self._item_dbid(items[nxt]) == current_dbid:
+                        return True
+                    return self._play_tree_item(items[nxt])
+            return False
+        except Exception as e:
+            logger.error("自然終了遷移エラー: %s", e)
+            return False
 
     def on_closing(self):
         """終了処理。WM_DELETE_WINDOW と 'm' キーの両方から呼ばれる。
@@ -1030,6 +1100,8 @@ class ITunesTkApp:
         # 一覧で扱えない場合のみ iTunes 側のプレイリスト順/キューにフォールバック
         if not self._play_adjacent_in_list(1):
             playlist = getattr(self, "_playback_playlist", None)
+            # フォールバックの遷移先は不明なため自然終了補正の対象外にする（Issue #37）
+            self._suppress_track_correction = True
             if getattr(self, "_com_task_queue", None) is not None:
                 self._com_submit("play_next_track", playlist)
             else:
@@ -1039,6 +1111,7 @@ class ITunesTkApp:
     def prev_track(self):
         if not self._play_adjacent_in_list(-1):
             playlist = getattr(self, "_playback_playlist", None)
+            self._suppress_track_correction = True
             if getattr(self, "_com_task_queue", None) is not None:
                 self._com_submit("play_previous_track", playlist)
             else:
@@ -1129,12 +1202,16 @@ class ITunesTkApp:
                 ids['dbid'], ids['pid'], name, None, None,
                 _result_tag=("play_track", name, playlist),
             )
+            # 遷移先の dbid を記録し自然終了補正の対象外にする（Issue #37）
+            self._expected_dbid = ids['dbid']
             return True
         if ids['location']:
             self._com_submit(
                 "play_track_by_location", ids['location'],
                 _result_tag=("play_track", name, playlist),
             )
+            # 遷移先 dbid が不明なため補正対象外にする
+            self._suppress_track_correction = True
             return True
         return False
 
@@ -1363,6 +1440,8 @@ class ITunesTkApp:
                     "play_playlist", playlist_name,
                     _result_tag=("play_playlist", playlist_name),
                 )
+                # 遷移先 dbid が不明なため自然終了補正の対象外にする（Issue #37）
+                self._suppress_track_correction = True
             
             # トラック一覧の読み込み（バックグラウンド）
             self.load_tracks(playlist_name)
@@ -1645,6 +1724,8 @@ class ITunesTkApp:
                     _result_tag=("play_track", track_name, current_playlist),
                 )
                 submitted = True
+                # 遷移先の dbid を記録し自然終了補正の対象外にする（Issue #37）
+                self._expected_dbid = ids['dbid']
             elif ids['location']:
                 fn = getattr(self.ctrl, 'play_track_by_location', None)
                 if callable(fn):
@@ -1653,6 +1734,7 @@ class ITunesTkApp:
                         _result_tag=("play_track", track_name),
                     )
                     submitted = True
+                    self._suppress_track_correction = True
 
             if submitted:
                 self._log_action(f"トラック再生要求: {track_name or '-'}")
