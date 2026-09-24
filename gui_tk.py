@@ -215,6 +215,14 @@ class ITunesTkApp:
         self._com_worker_thread: threading.Thread | None = None
         # ポーリングで得た最新のトラック情報（UI側はCOMを直接呼ばずこれを参照）
         self._latest_track_info: dict | None = None
+        # logging の WARNING 以上を _ui_queue 経由でログ枠へ転送するハンドラ。
+        # PyInstaller exe（windowed）では logging の出力先が無く失敗理由が見えないため。
+        self._ui_log_handler = None
+        try:
+            self._ui_log_handler = self._create_ui_log_handler()
+            logging.getLogger().addHandler(self._ui_log_handler)
+        except Exception:
+            self._ui_log_handler = None
         # シークバーのデバウンス管理（ドラッグ中のモーションイベントを1回のシークにまとめる）
         self._seek_pending_value: float | None = None
         self._seek_after_id = None
@@ -650,6 +658,23 @@ class ITunesTkApp:
         except Exception:
             pass
 
+    def _create_ui_log_handler(self) -> logging.Handler:
+        """WARNING 以上のログレコードを _ui_queue 経由でログ枠へ転送するハンドラを返す。
+        emit は呼出しスレッド（ワーカー等）で実行されるが _ui_put はスレッドセーフ。
+        """
+        ui_put = self._ui_put
+
+        class _UILogHandler(logging.Handler):
+            def emit(self, record):
+                try:
+                    ui_put("log", f"[{record.levelname}] {self.format(record)}")
+                except Exception:
+                    pass
+
+        handler = _UILogHandler(level=logging.WARNING)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler
+
     def _drain_ui_queue(self):
         """UIスレッド側: ワーカーからのメッセージを処理する。
         1ティックで処理する件数を制限してUIスレッドを占有しすぎない。"""
@@ -704,6 +729,9 @@ class ITunesTkApp:
                         self._playback_playlist = name
                     else:
                         self._log_action(f"プレイリスト再生失敗: {name or '-'}")
+                elif kind == "add_to_playlist":
+                    widget_idx = tag[2] if len(tag) > 2 else None
+                    self._apply_add_result(name, widget_idx, result)
         except Exception as e:
             logger.error("タスク結果処理エラー: %s", e)
 
@@ -797,6 +825,15 @@ class ITunesTkApp:
         if self._closing:
             return
         self._closing = True
+
+        # ログ枠転送ハンドラを外す（終了後にレコードがキューへ積まれ続けないように）
+        try:
+            handler = getattr(self, "_ui_log_handler", None)
+            if handler is not None:
+                logging.getLogger().removeHandler(handler)
+                self._ui_log_handler = None
+        except Exception:
+            pass
 
         # 実行中のトラック読み込みワーカーにキャンセルを通知
         try:
@@ -1011,24 +1048,36 @@ class ITunesTkApp:
         widget_idx = idx % self.bank_size
         if 0 <= idx < len(self.quick_slots):
             name = self.quick_slots[idx]
-            # Search APIベースなのでキャッシュ不要、即座に追加
-            result = self.ctrl.add_to_playlist(name)
-            if result == "already_exists":
-                self._log_action(f"既に存在: {name}")
-                self._flash_slot(widget_idx, "warning")
-            elif result == "added":
-                self._log_action(f"追加: {name}")
-                self._flash_slot(widget_idx, "success")
+            # COM呼出しはワーカーへ委譲してUIスレッドをブロックしない（#5/#33）。
+            # ワーカー無し時のみ従来通り直接呼出しにフォールバック
+            if getattr(self, "_com_task_queue", None) is not None:
+                self._com_submit(
+                    "add_to_playlist", name,
+                    _result_tag=("add_to_playlist", name, widget_idx),
+                )
             else:
-                self._log_action(f"追加失敗: {name}")
-                self._flash_slot(widget_idx, "error")
+                self._apply_add_result(
+                    name, widget_idx, self.ctrl.add_to_playlist(name)
+                )
         else:
             self._log_action("未設定スロット")
             self._flash_slot(widget_idx, "warning")
 
-    def _flash_slot(self, widget_idx: int, status: str):
+    def _apply_add_result(self, name: str, widget_idx, result):
+        """add_to_playlist の結果をログとスロットフラッシュへ反映する（UIスレッド）"""
+        if result == "already_exists":
+            self._log_action(f"既に存在: {name}")
+            self._flash_slot(widget_idx, "warning")
+        elif result == "added":
+            self._log_action(f"追加: {name}")
+            self._flash_slot(widget_idx, "success")
+        else:
+            self._log_action(f"追加失敗: {name}")
+            self._flash_slot(widget_idx, "error")
+
+    def _flash_slot(self, widget_idx, status: str):
         """スロットを一瞬色でフィードバックする。status: success/error/warning"""
-        if not (0 <= widget_idx < len(self.slot_labels)):
+        if widget_idx is None or not (0 <= widget_idx < len(self.slot_labels)):
             return
         colors = {
             "success": ("#2e7d32", "#ffffff"),
