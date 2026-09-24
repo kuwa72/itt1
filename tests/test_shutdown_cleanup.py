@@ -161,15 +161,7 @@ def test_poll_track_queue_does_not_reschedule_when_closing():
     app.track_tree.insert.assert_not_called()
 
 
-def test_sync_to_itunes_state_noop_when_closing():
-    """終了処理中に残存していた起動時同期が発火してもCOMを触らない"""
-    app = _make_app()
-    app._closing = True
-    app._sync_to_itunes_state()
-    app.ctrl.get_current_track_info.assert_not_called()
 
-
-# --- 'm' キーの終了経路 ---
 
 def test_m_key_routes_through_on_closing():
     """'m' キーは root.destroy を直接呼ばず on_closing 経路を通る"""

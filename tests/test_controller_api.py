@@ -1,8 +1,7 @@
-"""コントローラー公開APIの存在確認と、削除したデッドコードの不在確認。
+"""コントローラー公開APIの存在確認と、削除した再生系APIの不在確認。
 
-gui_tk が呼ぶメソッド群は削除後も維持される必要がある。
-インスタンス化は __init__ が COM/AppleScript へ接続するため行わず、
-クラス属性としての存在だけを検証する。
+Issue #39 以降、コントローラーはプレイリスト管理（列挙・作成・トラック追加）のみを担う。
+再生系メソッドは playback_engine（ローカル再生）に移譲され、コントローラーからは削除済み。
 """
 
 import ast
@@ -16,28 +15,37 @@ from music_controller_windows import WindowsMusicController
 
 # gui_tk が両プラットフォーム共通で呼ぶ公開メソッド
 COMMON_REQUIRED_METHODS = [
+    "get_playlists",
+    "get_all_playlists",
+    "add_to_playlist",
+    "create_playlist",
+    "create_worker_controller",
+    "close",
+]
+
+# Issue #39 で削除された再生系メソッド（両プラットフォーム）
+PLAYBACK_REMOVED_METHODS = [
     "get_current_track_info",
+    "get_current_playlist_name",
     "play_pause",
     "play_next_track",
     "play_previous_track",
     "skip_forward",
     "skip_backward",
-    "get_playlists",
-    "get_all_playlists",
-    "add_to_playlist",
-    "create_playlist",
-    "set_current_track_bpm",
     "get_volume",
     "set_volume",
+    "set_current_track_bpm",
 ]
 
-# gui_tk が呼ぶが現状 Windows 側にのみ実装があるメソッド
-# (macOS 側は hasattr ガードや try/except で吸収されている)
-WINDOWS_REQUIRED_METHODS = [
+# Issue #39 で Windows 側から削除された再生系メソッド
+WINDOWS_REMOVED_PLAYBACK_METHODS = [
     "set_player_position",
     "play_playlist",
     "play_track_by_ids",
     "play_track_by_location",
+    "_play_adjacent_track",
+    "_play_playlist_neighbor",
+    "_find_playlist_track_index",
 ]
 
 # Issue #8 で削除対象となったデッドコード
@@ -67,10 +75,19 @@ def test_controller_exposes_common_gui_api(cls, method):
     )
 
 
-@pytest.mark.parametrize("method", WINDOWS_REQUIRED_METHODS)
-def test_windows_controller_exposes_windows_api(method):
-    assert callable(getattr(WindowsMusicController, method, None)), (
-        f"WindowsMusicController.{method} が存在しない（gui_tk が依存）"
+@pytest.mark.parametrize("cls", [WindowsMusicController, MacOSMusicController])
+@pytest.mark.parametrize("method", PLAYBACK_REMOVED_METHODS)
+def test_playback_methods_removed(cls, method):
+    """再生は playback_engine に移譲済みのためコントローラーに存在しないこと"""
+    assert not hasattr(cls, method), (
+        f"{cls.__name__}.{method} は再生エンジン移譲のため削除されているはず"
+    )
+
+
+@pytest.mark.parametrize("method", WINDOWS_REMOVED_PLAYBACK_METHODS)
+def test_windows_playback_methods_removed(method):
+    assert not hasattr(WindowsMusicController, method), (
+        f"WindowsMusicController.{method} は再生エンジン移譲のため削除されているはず"
     )
 
 

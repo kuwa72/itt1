@@ -69,6 +69,36 @@ if ($ForceReinstall -or (-not (Test-Path $BuildInstalledMarker)) -or (-not (Test
     Write-Host "[itt1] Dependencies and PyInstaller ready." -ForegroundColor Green
 }
 
+# 3.5 Ensure libmpv-2.dll (ローカル再生エンジン用。リポジトリにはコミットしない)
+$MpvDll = Join-Path $ScriptDir "libmpv-2.dll"
+if (-not (Test-Path $MpvDll)) {
+    Write-Host "[itt1] libmpv-2.dll not found. Downloading mpv dev archive..." -ForegroundColor Cyan
+    try {
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+        $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
+        if (-not $asset) {
+            Write-Error "mpv dev archive not found in the latest shinchiro release."
+            exit 1
+        }
+        $archive = Join-Path $env:TEMP $asset.name
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+        $extractDir = Join-Path $env:TEMP "itt1-mpv-dev"
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        # Windows 10+ 同梱の tar(bsdtar) は .7z を展開できる
+        tar -xf $archive -C (New-Item -ItemType Directory -Force -Path $extractDir).FullName
+        $found = Get-ChildItem $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
+        if (-not $found) {
+            Write-Error "libmpv-2.dll not found inside the mpv dev archive."
+            exit 1
+        }
+        Copy-Item $found.FullName $MpvDll
+        Write-Host "[itt1] libmpv-2.dll acquired." -ForegroundColor Green
+    } catch {
+        Write-Error "Failed to acquire libmpv-2.dll: $_"
+        exit 1
+    }
+}
+
 # 4. Build exe with PyInstaller
 Write-Host "[itt1] Building executable with PyInstaller..." -ForegroundColor Cyan
 $ExePath = Join-Path $ScriptDir "dist\iTunesController.exe"

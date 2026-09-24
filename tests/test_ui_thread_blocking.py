@@ -90,6 +90,11 @@ def _make_app() -> ITunesTkApp:
     app._volume_seeking = False
     app._volume_pending_value = None
     app._volume_after_id = None
+    # ローカル再生エンジン（Issue #39）
+    app.engine = MagicMock(name="engine")
+    app._current_track_meta = None
+    app._playback_playlist = None
+    app._pending_autoplay = None
     return app
 
 
@@ -203,7 +208,7 @@ def test_display_tracks_batch_handles_error_sentinel():
 # --- 2. シークバーのデバウンス ---
 
 def test_on_progress_change_debounces_and_offloads_seek():
-    """ドラッグ中の連続イベントはデバウンスされ、COM呼出しはワーカー経由で1回だけ"""
+    """ドラッグ中の連続イベントはデバウンスされ、エンジンへは1回だけ適用される"""
     app = _make_app()
     app._seeking = True
     app._latest_track_info = {"duration": 200.0}
@@ -211,18 +216,13 @@ def test_on_progress_change_debounces_and_offloads_seek():
     for v in (10, 20, 30, 40, 50):
         app.on_progress_change(v)
 
-    # UIスレッドではCOMを呼ばない
-    app.ctrl.set_player_position.assert_not_called()
-    app.ctrl.get_current_track_info.assert_not_called()
     # 先行スケジュールはキャンセルされ、最後の1発だけが残る
     assert app.root.after_cancel.call_count == 4
     assert app.root.after.call_args[0][0] == app.SEEK_DEBOUNCE_MS
 
-    # デバウンスコールバック発火 → COMタスクとしてキューに積まれる
+    # デバウンスコールバック発火 → エンジンへ絶対シーク（COM は介さない）
     app._flush_pending_seek()
-    task = app._com_task_queue.get_nowait()
-    app._execute_com_task(app.ctrl, task)
-    app.ctrl.set_player_position.assert_called_once_with(100.0)  # 50% * 200s
+    app.engine.seek_abs.assert_called_once_with(100.0)  # 50% * 200s
 
 
 def test_flush_pending_seek_is_idempotent():
@@ -234,7 +234,7 @@ def test_flush_pending_seek_is_idempotent():
     app._flush_pending_seek()
     app._flush_pending_seek()  # pending値は消費済み → 何もしない
 
-    assert app._com_task_queue.qsize() == 1
+    app.engine.seek_abs.assert_called_once_with(25.0)
 
 
 def test_on_progress_change_ignores_when_not_seeking():
@@ -246,7 +246,7 @@ def test_on_progress_change_ignores_when_not_seeking():
     app.on_progress_change(50)
 
     app.root.after.assert_not_called()
-    app.ctrl.set_player_position.assert_not_called()
+    app.engine.seek_abs.assert_not_called()
 
 
 # --- 2b. シークバーのクリック位置ジャンプ（Issue #24） ---
@@ -272,11 +272,9 @@ def test_progress_bar_press_seeks_to_click_position():
     app.root.after.assert_called_once()
     assert app.root.after.call_args[0][0] == app.SEEK_DEBOUNCE_MS
 
-    # デバウンス発火 → 曲長 200s の 25% = 50s へ COM ワーカー経由でシーク
+    # デバウンス発火 → 曲長 200s の 25% = 50s へエンジンでシーク
     app._flush_pending_seek()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert fn == "set_player_position"
-    assert args == (50.0,)
+    app.engine.seek_abs.assert_called_once_with(50.0)
 
 
 def test_progress_bar_press_clips_position_to_ends():
@@ -343,13 +341,16 @@ def test_update_ui_loop_does_not_call_get_current_track_info():
     app.root.after.assert_called_once()  # 再スケジュールは維持
 
 
-def test_update_ui_loop_applies_track_info_from_queue():
-    """ワーカーが _ui_queue に積んだトラック情報をウィジェットへ反映する"""
+def test_update_ui_loop_applies_track_info_from_engine():
+    """エンジン状態 + 再生中メタ情報がウィジェットへ反映される"""
     app = _make_app()
-    app._ui_queue.put(("track_info", {
-        "is_playing": True, "name": "n", "artist": "a", "album": "al",
-        "position": 10, "duration": 100, "dbid": 42, "playlist": "PL",
-    }))
+    app._current_track_meta = {
+        "dbid": 42, "name": "n", "artist": "a", "album": "al",
+    }
+    app._playback_playlist = "PL"
+    app.engine.get_state.return_value = {
+        "position": 10.0, "duration": 100.0, "is_playing": True, "volume": 50.0,
+    }
     app._on_track_changed = MagicMock(name="_on_track_changed")
 
     app.update_ui_loop()
@@ -361,13 +362,11 @@ def test_update_ui_loop_applies_track_info_from_queue():
     assert app._latest_track_info["dbid"] == 42
 
 
-def test_com_worker_polls_track_info_and_stops_cleanly():
-    """COMワーカーはタイムアウト時に get_current_track_info をポーリングし、
+def test_com_worker_stops_cleanly_without_polling():
+    """COMワーカーは再生状態をポーリングしない（再生はローカルエンジン担当）。
     停止イベントでループを抜けてワーカー用コントローラーを close する"""
     app = _make_app()
     worker_ctrl = MagicMock(name="worker_ctrl")
-    worker_ctrl.get_current_track_info.return_value = {"dbid": 7}
-    worker_ctrl.get_volume.return_value = 60  # Issue #25: 音量もポーリングに同梱
     app.ctrl.create_worker_controller.return_value = worker_ctrl
 
     def get_then_stop(timeout=None):
@@ -379,8 +378,8 @@ def test_com_worker_polls_track_info_and_stops_cleanly():
     app._com_worker_loop()
 
     app.ctrl.create_worker_controller.assert_called_once()
-    worker_ctrl.get_current_track_info.assert_called_once()
-    assert app._ui_queue.get_nowait() == ("track_info", {"dbid": 7, "volume": 60})
+    worker_ctrl.get_current_track_info.assert_not_called()
+    worker_ctrl.get_volume.assert_not_called()
     # ワーカー専用接続は使い終わったら close される
     worker_ctrl.close.assert_called_once()
 
@@ -427,57 +426,50 @@ def _setup_track_tree(app):
 
     def _item(iid, key):
         if key == "tags":
-            return ("dbid:123", "pid:PID1", "src:1", "pl:2", "tid:99", "po:5", "loc:C:/x.mp3")
+            return ("dbid:123", "pid:PID1", "src:1", "pl:2", "tid:99", "po:5",
+                    "loc:file://localhost/C:/x.mp3")
         return "Song"
 
     app.track_tree.item.side_effect = _item
     app._track_loading_playlist = "PL"
 
 
-def test_on_track_select_offloads_play_to_com_worker():
-    """ダブルクリック再生はUIスレッドで play_track_by_ids を呼ばずキューへ"""
+def test_on_track_select_plays_via_engine():
+    """ダブルクリック再生はCOMを介さずローカルエンジンで行パスのファイルを再生"""
     app = _make_app()
     _setup_track_tree(app)
 
     app.on_track_select(None)
 
-    app.ctrl.play_track_by_ids.assert_not_called()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert fn == "play_track_by_ids"
-    assert args == (1, 2, 99, 123, "PID1", "Song", "PL", 5)
-
-    # ワーカー実行 → 結果がUIキュー経由で last_action に反映される
-    app.ctrl.play_track_by_ids.return_value = True
-    app._execute_com_task(app.ctrl, (fn, args, kwargs, tag))
-    app.ctrl.play_track_by_ids.assert_called_once_with(*args)
-    app._drain_ui_queue()
-    assert app.last_action == "トラック再生: Song"
+    app.engine.play.assert_called_once()
+    assert "x.mp3" in app.engine.play.call_args[0][0]
+    assert app._current_track_meta["dbid"] == 123
+    assert "トラック再生: Song" in app.last_action
 
 
-def test_on_track_select_reports_failure_via_result_tag():
+def test_on_track_select_reports_play_failure():
+    """engine.play の失敗は例外を投げずログへ"""
     app = _make_app()
     _setup_track_tree(app)
+    app.engine.play.side_effect = RuntimeError("decode error")
 
     app.on_track_select(None)
 
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    app.ctrl.play_track_by_ids.return_value = False
-    app._execute_com_task(app.ctrl, (fn, args, kwargs, tag))
-    app._drain_ui_queue()
-    assert app.last_action == "トラック再生失敗"
+    assert "再生失敗" in app.last_action
 
 
-def test_on_playlist_select_offloads_play_playlist():
-    """プレイリスト再生もUIスレッドでCOMを呼ばない"""
+def test_on_playlist_select_loads_tracks_for_autoplay():
+    """プレイリスト選択はCOM再生を呼ばず、トラック読込＋先頭自動再生を予約する"""
     app = _make_app()
     app.playlist_listbox.curselection.return_value = (0,)
     app._playlist_raw_names = ["PL-A"]
+    app.load_tracks = MagicMock(name="load_tracks")
 
     app.on_playlist_select(None)
 
-    app.ctrl.play_playlist.assert_not_called()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("play_playlist", ("PL-A",))
+    app.load_tracks.assert_called_once_with("PL-A")
+    assert app._pending_autoplay == "PL-A"
+    assert app._com_task_queue.empty()
 
 
 # --- 5. プレイリスト一覧の非同期化 ---

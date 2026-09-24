@@ -35,6 +35,7 @@ def _make_app(with_worker=True):
     app._action_log = deque(maxlen=50)
     app.action_log_listbox = None
     app.ctrl = MagicMock(name="ctrl")
+    app._current_track_meta = {"dbid": 1, "name": "n"}
     app.root = MagicMock(name="root")
     app._after = MagicMock(name="_after")
     return app
@@ -53,7 +54,7 @@ class TestAddToSlotWorkerRouting:
         app.ctrl.add_to_playlist.assert_not_called()
         fn, args, kwargs, result_tag = app._com_task_queue.get_nowait()
         assert fn == "add_to_playlist"
-        assert args == ("PL-A",)
+        assert args == ("PL-A", 1, "n")
         assert result_tag[0] == "add_to_playlist"
         assert result_tag[1] == "PL-A"
 
@@ -76,7 +77,7 @@ class TestAddToSlotWorkerRouting:
 
         app.add_to_slot(0)
 
-        app.ctrl.add_to_playlist.assert_called_once_with("PL-A")
+        app.ctrl.add_to_playlist.assert_called_once_with("PL-A", 1, "n")
         assert "追加: PL-A" in app.last_action
 
     def test_task_result_updates_log_and_flash(self):
@@ -121,33 +122,37 @@ class TestAddToPlaylistFailureReasons:
         ctrl = _make_windows_ctrl()
         ctrl.itunes = None
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-            assert ctrl.add_to_playlist("PL") is False
+            assert ctrl.add_to_playlist("PL", 1, "n") is False
         assert "接続" in caplog.text or "itunes" in caplog.text.lower()
 
     def test_logs_reason_when_no_current_track(self, caplog):
+        """dbid 無し（ローカル再生中のトラックが無い）→ 理由ログ付き False"""
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = None
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-            assert ctrl.add_to_playlist("PL") is False
+            assert ctrl.add_to_playlist("PL", None) is False
         assert "トラック" in caplog.text
 
     def test_logs_reason_when_playlist_not_found(self, caplog):
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
+        ctrl._find_library_track = MagicMock(
+            return_value=SimpleNamespace(TrackDatabaseID=1)
+        )
         ctrl._find_playlist_by_name = MagicMock(return_value=None)
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-            assert ctrl.add_to_playlist("PL") is False
+            assert ctrl.add_to_playlist("PL", 1, "n") is False
         assert "PL" in caplog.text
 
     def test_logs_playlist_name_on_addtrack_error(self, caplog):
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
         target = MagicMock(name="playlist")
         target.Search.return_value = SimpleNamespace(Count=0)
         target.AddTrack.side_effect = RuntimeError("boom")
         ctrl._find_playlist_by_name = MagicMock(return_value=target)
+        ctrl._find_library_track = MagicMock(
+            return_value=SimpleNamespace(TrackDatabaseID=1)
+        )
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-            assert ctrl.add_to_playlist("PL") is False
+            assert ctrl.add_to_playlist("PL", 1, "n") is False
         assert "PL" in caplog.text
         assert "boom" in caplog.text
 
@@ -177,46 +182,51 @@ class TestAddTrackMakepyFallback:
 
     def test_castto_fallback_on_attributeerror(self):
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
+        lib_track = SimpleNamespace(TrackDatabaseID=1)
         target = self._make_base_playlist()
         ctrl._find_playlist_by_name = MagicMock(return_value=target)
+        ctrl._find_library_track = MagicMock(return_value=lib_track)
         casted = MagicMock(name="IITUserPlaylist")
 
         with patch(
             "music_controller_windows.win32com.client.CastTo",
             return_value=casted,
         ) as cast:
-            assert ctrl.add_to_playlist("PL") == "added"
+            assert ctrl.add_to_playlist("PL", 1, "n") == "added"
 
         cast.assert_called_once_with(target, "IITUserPlaylist")
-        casted.AddTrack.assert_called_once_with(ctrl.itunes.CurrentTrack)
+        casted.AddTrack.assert_called_once_with(lib_track)
 
     def test_castto_failure_returns_false(self, caplog):
         """CastTo 自体が失敗する対象（フォルダ等）は False + 理由ログ"""
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
         target = self._make_base_playlist()
         ctrl._find_playlist_by_name = MagicMock(return_value=target)
+        ctrl._find_library_track = MagicMock(
+            return_value=SimpleNamespace(TrackDatabaseID=1)
+        )
 
         with patch(
             "music_controller_windows.win32com.client.CastTo",
             side_effect=RuntimeError("not a user playlist"),
         ):
             with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-                assert ctrl.add_to_playlist("PL") is False
+                assert ctrl.add_to_playlist("PL", 1, "n") is False
         assert "PL" in caplog.text
 
     def test_addtrack_com_error_logged(self, caplog):
         """AddTrack 呼出し自体の失敗（スマートプレイリスト等）は理由ログ付き False"""
         ctrl = _make_windows_ctrl()
-        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
         target = MagicMock(name="playlist")
         target.Search.return_value = SimpleNamespace(Count=0)
         target.AddTrack.side_effect = RuntimeError("read only playlist")
         ctrl._find_playlist_by_name = MagicMock(return_value=target)
+        ctrl._find_library_track = MagicMock(
+            return_value=SimpleNamespace(TrackDatabaseID=1)
+        )
 
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-            assert ctrl.add_to_playlist("PL") is False
+            assert ctrl.add_to_playlist("PL", 1, "n") is False
         assert "read only playlist" in caplog.text
 
 
