@@ -209,8 +209,10 @@ class ITunesTkApp:
         # 曲変更検知用
         self._synced_dbid: int | None = None
         self._synced_playlist: str | None = None
-        # 再生コンテキストのプレイリスト名（_play_tree_item で再生した行の所属一覧）
-        self._playback_playlist: str | None = None
+        # 再生中トラックが所属するプレイリスト名（_play_tree_item 実行時点の
+        # 表示プレイリストを記録。以後の表示切替で変化する _track_loading_playlist
+        # とは独立に保持する。Issue #44）
+        self._now_playing_playlist: str | None = None
         # ローカル再生エンジンが現在再生中の行のメタ情報
         self._current_track_meta: dict | None = None
         # プレイリスト選択時の先頭曲自動再生（load_tracks の初回バッチで実行）
@@ -789,7 +791,7 @@ class ITunesTkApp:
             "artist": meta.get("artist", "-"),
             "album": meta.get("album", "-"),
             "dbid": meta.get("dbid"),
-            "playlist": getattr(self, "_playback_playlist", None),
+            "playlist": getattr(self, "_now_playing_playlist", None),
             "position": st.get("position") or 0,
             "duration": st.get("duration") or meta.get("duration") or 0,
             "is_playing": st.get("is_playing", False),
@@ -1238,7 +1240,9 @@ class ITunesTkApp:
         meta = dict(getattr(self, "_track_tree_item_meta", {}).get(item) or {})
         meta["dbid"] = ids.get("dbid")
         self._current_track_meta = meta
-        self._playback_playlist = getattr(self, "_track_loading_playlist", None)
+        # 再生した行が所属するプレイリスト＝この時点で表示中のプレイリスト。
+        # 再生後に別プレイリストを表示しても追従しないよう専用フィールドへ記録する
+        self._now_playing_playlist = getattr(self, "_track_loading_playlist", None)
         self._log_action(f"トラック再生: {name or '-'}")
         return True
 
@@ -2286,43 +2290,25 @@ class ITunesTkApp:
             self.action_log_frame.pack_forget()
     
     def goto_current_track(self):
-        """現在再生中のプレイリストとトラックに移動"""
+        """現在再生中のプレイリストとトラックに移動（「再生中へ」ボタン / Ctrl+G）
+
+        再生中トラックの所属プレイリストは _now_playing_playlist で追跡する
+        （_play_tree_item 実行時点の表示プレイリスト。Issue #44）。
+        遷移とハイライトは曲変更検知と同じ _on_track_changed の経路を使う。
+        """
         try:
             self._manual_playlist_view = False
             info = getattr(self, "_latest_track_info", None) or {}
-            playlist_name = info.get('playlist') or getattr(self, "_playback_playlist", None)
+            playlist_name = info.get('playlist') or getattr(self, "_now_playing_playlist", None)
             if not playlist_name:
                 self._log_action("再生中のプレイリストがありません")
                 return
 
-            # プレイリスト一覧から該当プレイリストを選択
-            self._select_playlist_in_listbox(playlist_name)
-
-            # トラック一覧を読み込む
-            self.load_tracks(playlist_name)
-
-            # 現在のトラックを選択（ポーリング済みキャッシュのみ使用しCOMは呼ばない。
-            # 未取得でも読込完了時に _track_loading_dbid 経由でハイライトされる）
-            current_dbid = info.get('dbid')
-            
-            if current_dbid:
-                # トラック一覧から該当トラックを探して選択
-                for item in self.track_tree.get_children():
-                    tags = self.track_tree.item(item, 'tags')
-                    for tag in tags:
-                        if tag.startswith('dbid:'):
-                            try:
-                                dbid = int(tag.split(':')[1])
-                                if dbid == current_dbid:
-                                    self.track_tree.selection_set(item)
-                                    self.track_tree.see(item)
-                                    self.track_tree.focus(item)
-                                    self._log_action(f"再生中の曲へ移動: {playlist_name}")
-                                    return
-                            except Exception:
-                                pass
-            
-            self._log_action(f"プレイリストへ移動: {playlist_name}")
+            # 既に再生中プレイリストを表示中なら行ハイライトのみ、
+            # 別プレイリスト表示中なら一覧を選択・読み込み、読込完了後に
+            # _track_loading_dbid 経由で再生中行がハイライトされる
+            self._on_track_changed(playlist_name, info.get('dbid'))
+            self._log_action(f"再生中の曲へ移動: {playlist_name}")
         except Exception as e:
             logger.error("再生中の曲へ移動エラー: %s", e)
 

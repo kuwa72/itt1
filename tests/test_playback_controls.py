@@ -53,7 +53,7 @@ def _make_app() -> ITunesTkApp:
     app._volume_seeking = False
     app._volume_pending_value = None
     app._volume_after_id = None
-    app._playback_playlist = None
+    app._now_playing_playlist = None
     app._after = MagicMock(name="_after", side_effect=lambda ms, fn: "after-id")
     return app
 
