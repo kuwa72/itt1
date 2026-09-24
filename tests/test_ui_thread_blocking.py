@@ -93,7 +93,7 @@ def _make_app() -> ITunesTkApp:
     # ローカル再生エンジン（Issue #39）
     app.engine = MagicMock(name="engine")
     app._current_track_meta = None
-    app._playback_playlist = None
+    app._now_playing_playlist = None
     app._pending_autoplay = None
     return app
 
@@ -347,7 +347,7 @@ def test_update_ui_loop_applies_track_info_from_engine():
     app._current_track_meta = {
         "dbid": 42, "name": "n", "artist": "a", "album": "al",
     }
-    app._playback_playlist = "PL"
+    app._now_playing_playlist = "PL"
     app.engine.get_state.return_value = {
         "position": 10.0, "duration": 100.0, "is_playing": True, "volume": 50.0,
     }

@@ -171,7 +171,8 @@ def _make_app() -> ITunesTkApp:
     app.load_tracks = MagicMock(name="load_tracks")
     app.last_action = "-"
     app._latest_track_info = {}
-    app._playback_playlist = None
+    app._now_playing_playlist = None
+    app._track_loading_playlist = None
     return app
 
 

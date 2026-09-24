@@ -22,7 +22,7 @@ def _make_app(current_dbid=200):
     app._action_log = deque(maxlen=50)
     app.action_log_listbox = None
     app.engine = MagicMock(name="engine")
-    app._playback_playlist = "PL"
+    app._now_playing_playlist = "PL"
     app._track_loading_playlist = "PL"
     app._current_track_meta = {"dbid": current_dbid, "name": "B"}
     app._track_tree_item_meta = {}
