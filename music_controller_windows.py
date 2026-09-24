@@ -251,6 +251,101 @@ class WindowsMusicController:
             logger.error("プレイリスト作成エラー: %s", e)
             return False
 
+    def rename_playlist(self, old_name: str, new_name: str) -> bool:
+        """プレイリスト名を変更する（IITPlaylist.Name への代入）"""
+        if not self.itunes:
+            return False
+
+        target = self._find_playlist_by_name(old_name)
+        if target is None:
+            logger.error("プレイリスト名変更失敗: 見つかりません: %s", old_name)
+            return False
+
+        try:
+            target.Name = new_name
+            return True
+        except Exception as e:
+            logger.error("プレイリスト名変更エラー (%s → %s): %s", old_name, new_name, e)
+            return False
+
+    def delete_playlist(self, name: str) -> bool:
+        """プレイリストを削除する（IITObject.Delete()）"""
+        if not self.itunes:
+            return False
+
+        target = self._find_playlist_by_name(name)
+        if target is None:
+            logger.error("プレイリスト削除失敗: 見つかりません: %s", name)
+            return False
+
+        try:
+            target.Delete()
+            return True
+        except Exception as e:
+            logger.error("プレイリスト削除エラー (%s): %s", name, e)
+            return False
+
+    def create_folder(self, name: str) -> bool:
+        """フォルダプレイリストをメインライブラリ直下に作成する。
+
+        IITSource は CreateFolder を公開していない（iTunes 1.13 タイプライブラリで
+        実機検証済み）。IiTunes.CreateFolder(name) は常にメインライブラリ source 上に
+        作成するため、こちらを使う。
+        """
+        if not self.itunes:
+            return False
+
+        try:
+            self.itunes.CreateFolder(name)
+            return True
+        except Exception as e:
+            logger.error("フォルダ作成エラー (%s): %s", name, e)
+            return False
+
+    def move_playlist_to_folder(self, playlist_name: str, folder_name: str) -> bool:
+        """既存プレイリストをフォルダプレイリスト内へ移動する。
+
+        IITUserPlaylist.Parent はタイプライブラリ上 {get}{set} で、
+        実機検証で playlist.Parent = folder による移動が成功することを確認済み。
+        ターゲットは SpecialKind==Folder のプレイリストのみ受け付ける。
+        """
+        if not self.itunes:
+            return False
+
+        playlist = self._find_playlist_by_name(playlist_name)
+        if playlist is None:
+            logger.error("フォルダ移動失敗: プレイリストが見つかりません: %s", playlist_name)
+            return False
+
+        folder = self._find_playlist_by_name(folder_name)
+        if folder is None:
+            logger.error("フォルダ移動失敗: フォルダが見つかりません: %s", folder_name)
+            return False
+        if not self._is_folder_playlist(folder):
+            logger.error("フォルダ移動失敗: 移動先がフォルダではありません: %s", folder_name)
+            return False
+
+        try:
+            playlist.Parent = folder
+            return True
+        except AttributeError:
+            pass
+        except Exception as e:
+            logger.error("フォルダ移動エラー (%s → %s): %s", playlist_name, folder_name, e)
+            return False
+        # gen_py 静的ラッパー経由で IITPlaylist 基底型が返ると Parent が見えないため
+        # IITUserPlaylist へキャストして再試行する（_add_track と同じ経路）
+        try:
+            casted = win32com.client.CastTo(playlist, "IITUserPlaylist")
+            casted.Parent = folder
+            return True
+        except Exception as e:
+            logger.error(
+                "フォルダ移動失敗: 対象にParentがありません: %s → %s (%s)",
+                playlist_name, folder_name, e,
+            )
+            return False
+
     def _find_playlist_by_name(self, name: str):
         """名前でプレイリストを検索し返す（見つからなければNone）"""
         try:
