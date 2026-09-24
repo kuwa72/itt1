@@ -1026,23 +1026,117 @@ class ITunesTkApp:
         self._log_action(f"-{self.config.config.skip_seconds}秒")
 
     def next_track(self):
-        # プレイリスト内インデックス走査を含むCOM呼出しはワーカーへ委譲する
-        # （UIスレッドをブロックしない）。再生コンテキストのプレイリスト名を渡し、
-        # コントローラー側でプレイリスト内の隣接曲へ遷移させる（Issue #18）。
-        playlist = getattr(self, "_playback_playlist", None)
-        if getattr(self, "_com_task_queue", None) is not None:
-            self._com_submit("play_next_track", playlist)
-        else:
-            self.ctrl.play_next_track(playlist)
+        # 表示中トラック一覧の並びを優先（Issue #35: コントローラーがプレイヤー）。
+        # 一覧で扱えない場合のみ iTunes 側のプレイリスト順/キューにフォールバック
+        if not self._play_adjacent_in_list(1):
+            playlist = getattr(self, "_playback_playlist", None)
+            if getattr(self, "_com_task_queue", None) is not None:
+                self._com_submit("play_next_track", playlist)
+            else:
+                self.ctrl.play_next_track(playlist)
         self._log_action("次の曲")
 
     def prev_track(self):
-        playlist = getattr(self, "_playback_playlist", None)
-        if getattr(self, "_com_task_queue", None) is not None:
-            self._com_submit("play_previous_track", playlist)
-        else:
-            self.ctrl.play_previous_track(playlist)
+        if not self._play_adjacent_in_list(-1):
+            playlist = getattr(self, "_playback_playlist", None)
+            if getattr(self, "_com_task_queue", None) is not None:
+                self._com_submit("play_previous_track", playlist)
+            else:
+                self.ctrl.play_previous_track(playlist)
         self._log_action("前の曲")
+
+    def _play_adjacent_in_list(self, direction: int) -> bool:
+        """表示中トラック一覧の並びで隣接行を再生する。扱えたら True。
+
+        コントローラー利用中はこの一覧が「プレイヤーの再生順」なので、
+        iTunes 側のキューや PlayOrderIndex ではなく表示順（列ソート後を含む）に
+        従う（Issue #35）。プレイリスト列挙も行わないため高速。
+        """
+        try:
+            if getattr(self, "_com_task_queue", None) is None:
+                return False
+            info = getattr(self, "_latest_track_info", None) or {}
+            dbid = info.get("dbid")
+            if dbid is None:
+                return False
+            items = list(self.track_tree.get_children(''))
+            cur_pos = None
+            for pos, iid in enumerate(items):
+                if self._item_dbid(iid) == dbid:
+                    cur_pos = pos
+                    break
+            if cur_pos is None:
+                return False
+            target_pos = cur_pos + direction
+            if not (0 <= target_pos < len(items)):
+                return False
+            return self._play_tree_item(items[target_pos])
+        except Exception as e:
+            logger.error("一覧内遷移エラー: %s", e)
+            return False
+
+    def _item_dbid(self, item):
+        """tree行の dbid タグだけを取り出す（一覧内位置特定用の軽量版）"""
+        try:
+            for tag in self.track_tree.item(item, 'tags') or ():
+                if tag.startswith('dbid:'):
+                    v = tag.split(':', 1)[1]
+                    return int(v) if v not in ('', 'None') else None
+        except Exception:
+            pass
+        return None
+
+    def _track_ids_from_item(self, item) -> dict:
+        """tree行のタグから再生用ID一式を取り出す"""
+        ids = {
+            "dbid": None, "pid": None, "source_id": None,
+            "playlist_id": None, "track_id": None,
+            "play_order": None, "location": None,
+        }
+        try:
+            tags = self.track_tree.item(item, 'tags')
+        except Exception:
+            return ids
+        int_keys = {"dbid": "dbid", "src": "source_id", "pl": "playlist_id",
+                    "tid": "track_id", "po": "play_order"}
+        for tag in tags or ():
+            key, _, v = tag.partition(':')
+            try:
+                if key in int_keys:
+                    ids[int_keys[key]] = int(v) if v not in ('', 'None') else None
+                elif key == 'pid':
+                    ids['pid'] = v if v not in ('', 'None') else None
+                elif key == 'loc':
+                    ids['location'] = v if v not in ('', 'None') else None
+            except Exception:
+                continue
+        return ids
+
+    def _play_tree_item(self, item) -> bool:
+        """track_tree の行を COM ワーカー経由で再生する。投入できれば True。
+
+        iTunes 側のキュー/コンテキストは意図的に確立しない（Issue #35: この一覧が
+        プレイヤーの再生順）。ライブラリ Search + Play の軽量経路を使うため
+        play_track_by_ids の playlist_name/play_order には None を渡す。
+        """
+        ids = self._track_ids_from_item(item)
+        name = self.track_tree.item(item, 'text') or None
+        playlist = getattr(self, "_track_loading_playlist", None)
+        if ids['pid'] or ids['dbid'] is not None:
+            self._com_submit(
+                "play_track_by_ids",
+                ids['source_id'], ids['playlist_id'], ids['track_id'],
+                ids['dbid'], ids['pid'], name, None, None,
+                _result_tag=("play_track", name, playlist),
+            )
+            return True
+        if ids['location']:
+            self._com_submit(
+                "play_track_by_location", ids['location'],
+                _result_tag=("play_track", name, playlist),
+            )
+            return True
+        return False
 
     def add_to_slot(self, idx: int):
         widget_idx = idx % self.bank_size
@@ -1535,61 +1629,27 @@ class ITunesTkApp:
             if not selection:
                 return
             item = selection[0]
-            tags = self.track_tree.item(item, 'tags')
-            
-            # DBID, Persistent ID, IITObject IDsを取得
-            dbid: int | None = None
-            pid: str | None = None
-            source_id: int | None = None
-            playlist_id: int | None = None
-            track_id: int | None = None
-            play_order: int | None = None
-            location: str | None = None
+            ids = self._track_ids_from_item(item)
 
-            for tag in tags:
-                try:
-                    if tag.startswith('dbid:'):
-                        v = tag.split(':', 1)[1]
-                        dbid = int(v) if v not in (None, '', 'None') else None
-                    elif tag.startswith('pid:'):
-                        v = tag.split(':', 1)[1]
-                        pid = v if v not in (None, '', 'None') else None
-                    elif tag.startswith('src:'):
-                        v = tag.split(':', 1)[1]
-                        source_id = int(v) if v not in (None, '', 'None') else None
-                    elif tag.startswith('pl:'):
-                        v = tag.split(':', 1)[1]
-                        playlist_id = int(v) if v not in (None, '', 'None') else None
-                    elif tag.startswith('tid:'):
-                        v = tag.split(':', 1)[1]
-                        track_id = int(v) if v not in (None, '', 'None') else None
-                    elif tag.startswith('po:'):
-                        v = tag.split(':', 1)[1]
-                        play_order = int(v) if v not in (None, '', 'None') else None
-                    elif tag.startswith('loc:'):
-                        v = tag.split(':', 1)[1]
-                        location = v if v not in (None, '', 'None') else None
-                except Exception:
-                    continue
-            
             track_name = self.track_tree.item(item, 'text') or None
             current_playlist = self._track_loading_playlist
             submitted = False
-            if pid or dbid is not None:
+            if ids['pid'] or ids['dbid'] is not None:
                 # COM再生呼出し(PlayFirstTrack+sleepを含む)はワーカーへ委譲し、
                 # 結果は result_tag 経由でUIへ反映する（UIスレッドをブロックしない）
                 self._com_submit(
                     "play_track_by_ids",
-                    source_id, playlist_id, track_id, dbid, pid, track_name,
-                    current_playlist, play_order,
+                    ids['source_id'], ids['playlist_id'], ids['track_id'],
+                    ids['dbid'], ids['pid'], track_name,
+                    current_playlist, ids['play_order'],
                     _result_tag=("play_track", track_name, current_playlist),
                 )
                 submitted = True
-            elif location:
+            elif ids['location']:
                 fn = getattr(self.ctrl, 'play_track_by_location', None)
                 if callable(fn):
                     self._com_submit(
-                        "play_track_by_location", location,
+                        "play_track_by_location", ids['location'],
                         _result_tag=("play_track", track_name),
                     )
                     submitted = True
