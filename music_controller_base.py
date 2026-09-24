@@ -151,3 +151,44 @@ class MacOSMusicController:
             return True
         except Exception:
             return False
+
+    def rename_playlist(self, old_name: str, new_name: str) -> bool:
+        script = (
+            f'tell application "Music" to set name of user playlist "{old_name}"'
+            f' to "{new_name}"'
+        )
+        try:
+            self._run_applescript(script)
+            return True
+        except Exception:
+            return False
+
+    def delete_playlist(self, name: str) -> bool:
+        script = f'tell application "Music" to delete user playlist "{name}"'
+        try:
+            self._run_applescript(script)
+            return True
+        except Exception:
+            return False
+
+    def create_folder(self, name: str) -> bool:
+        script = (
+            f'tell application "Music" to make new folder playlist'
+            f' with properties {{name:"{name}"}}'
+        )
+        try:
+            self._run_applescript(script)
+            return True
+        except Exception:
+            return False
+
+    def move_playlist_to_folder(self, playlist_name: str, folder_name: str) -> bool:
+        script = (
+            f'tell application "Music" to move user playlist "{playlist_name}"'
+            f' to folder playlist "{folder_name}"'
+        )
+        try:
+            self._run_applescript(script)
+            return True
+        except Exception:
+            return False

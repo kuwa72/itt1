@@ -406,6 +406,8 @@ class ITunesTkApp:
         self.playlist_listbox.bind("<Down>", self.on_playlist_nav_down)
         self.playlist_listbox.bind("<Return>", self.on_playlist_enter)
         self.playlist_listbox.bind("<space>", self.on_playlist_space)
+        # 右クリック: 名前変更/削除/フォルダ作成のコンテキストメニュー（Issue #42）
+        self.playlist_listbox.bind("<Button-3>", self._on_playlist_context_menu)
         
         # トラック一覧
         self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
@@ -713,6 +715,25 @@ class ITunesTkApp:
                 if kind == "add_to_playlist":
                     widget_idx = tag[2] if len(tag) > 2 else None
                     self._apply_add_result(name, widget_idx, result)
+                elif kind == "playlist_rename":
+                    new_name = tag[2] if len(tag) > 2 else None
+                    if result:
+                        self._log_action(f"プレイリスト名変更: {name} → {new_name}")
+                        self.load_playlists()
+                    else:
+                        self._log_action(f"プレイリスト名変更失敗: {name}")
+                elif kind == "playlist_delete":
+                    if result:
+                        self._log_action(f"プレイリスト削除: {name}")
+                        self.load_playlists()
+                    else:
+                        self._log_action(f"プレイリスト削除失敗: {name}")
+                elif kind == "playlist_create_folder":
+                    if result:
+                        self._log_action(f"フォルダ作成: {name}")
+                        self.load_playlists()
+                    else:
+                        self._log_action(f"フォルダ作成失敗: {name}")
         except Exception as e:
             logger.error("タスク結果処理エラー: %s", e)
 
@@ -1321,6 +1342,119 @@ class ITunesTkApp:
         ok = self.ctrl.create_playlist(name)
         self.refresh_playlists()
         self._log_action(f"プレイリスト作成: {'成功' if ok else '失敗'} ({name})")
+
+    # --- プレイリスト操作（Issue #42）: 右クリックメニューから実行 ---
+    # COM 呼出しはすべて _com_submit 経由でワーカースレッドへ投げ、
+    # 結果は _handle_task_result でログ枠へ反映＋成功時に load_playlists で再読込。
+
+    def _on_playlist_context_menu(self, event):
+        """右クリック: カーソル位置の項目を選択してからメニューを出す"""
+        try:
+            idx = self.playlist_listbox.nearest(event.y)
+            if idx is not None and 0 <= idx < self.playlist_listbox.size():
+                self.playlist_listbox.selection_clear(0, tk.END)
+                self.playlist_listbox.selection_set(idx)
+        except Exception:
+            pass
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="名前変更", command=self.rename_selected_playlist)
+        menu.add_command(label="削除", command=self.delete_selected_playlist)
+        menu.add_separator()
+        menu.add_command(label="フォルダ作成", command=self.create_playlist_folder)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _selected_playlist_name(self):
+        """選択中プレイリストの生名を返す（表示ラベルはフォルダ/名 形式の場合あり）"""
+        try:
+            selection = self.playlist_listbox.curselection()
+            if not selection:
+                return None
+            names = getattr(self, "_playlist_raw_names", None) or []
+            idx = selection[0]
+            if not (0 <= idx < len(names)):
+                return None
+            return names[idx]
+        except Exception:
+            return None
+
+    def rename_selected_playlist(self):
+        """選択中プレイリストの名前変更（COM はワーカー経由）"""
+        from tkinter import simpledialog
+        old = self._selected_playlist_name()
+        if not old:
+            self._log_action("プレイリストが選択されていません")
+            return
+        self._begin_modal()
+        try:
+            new = simpledialog.askstring(
+                "プレイリスト名変更", "新しい名前:", initialvalue=old, parent=self.root)
+        finally:
+            self._end_modal()
+        if not new or new == old:
+            self._log_action("プレイリスト名変更キャンセル")
+            return
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit(
+                "rename_playlist", old, new,
+                _result_tag=("playlist_rename", old, new),
+            )
+        else:
+            self._handle_task_result(
+                ("playlist_rename", old, new),
+                self.ctrl.rename_playlist(old, new),
+            )
+
+    def delete_selected_playlist(self):
+        """選択中プレイリストの削除（確認ダイアログあり、COM はワーカー経由）"""
+        name = self._selected_playlist_name()
+        if not name:
+            self._log_action("プレイリストが選択されていません")
+            return
+        self._begin_modal()
+        try:
+            ok = messagebox.askyesno(
+                "プレイリスト削除", f"'{name}' を削除しますか？", parent=self.root)
+        finally:
+            self._end_modal()
+        if not ok:
+            self._log_action("プレイリスト削除キャンセル")
+            return
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit(
+                "delete_playlist", name,
+                _result_tag=("playlist_delete", name),
+            )
+        else:
+            self._handle_task_result(
+                ("playlist_delete", name),
+                self.ctrl.delete_playlist(name),
+            )
+
+    def create_playlist_folder(self):
+        """フォルダプレイリストを作成（COM はワーカー経由）"""
+        from tkinter import simpledialog
+        self._begin_modal()
+        try:
+            name = simpledialog.askstring(
+                "フォルダ作成", "作成するフォルダ名を入力:", parent=self.root)
+        finally:
+            self._end_modal()
+        if not name:
+            self._log_action("フォルダ作成キャンセル")
+            return
+        if getattr(self, "_com_task_queue", None) is not None:
+            self._com_submit(
+                "create_folder", name,
+                _result_tag=("playlist_create_folder", name),
+            )
+        else:
+            self._handle_task_result(
+                ("playlist_create_folder", name),
+                self.ctrl.create_folder(name),
+            )
 
     def refresh_playlists(self):
         # 画面上はスロットの存在状態を色分けなどしない。必要なら後で拡張
