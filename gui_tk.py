@@ -171,6 +171,13 @@ class ITunesTkApp:
         self._library_xml_loader_thread: threading.Thread | None = None
         # プレイリスト一覧の表示ラベルに対応する実プレイリスト名（リストボックスのインデックスと対応）
         self._playlist_raw_names: List[str] = []
+        # プレイリスト検索フィルタのクエリ（casefold 済み）と、
+        # フィルタ適用後にリストボックスへ表示中の実プレイリスト名（行インデックス対応）
+        self._playlist_filter_query: str = ""
+        self._playlist_visible_names: List[str] = []
+        # トラック検索フィルタのクエリと全行iidの現在順（フィルタ復帰・列ソート連携用）
+        self._track_filter_query: str = ""
+        self._track_tree_order: List[str] = []
         self.tap_times: List[float] = []
         self.bpm_value: float | None = None
         # ASCII keyboard top 3 rows: number row + QWERTY + ASDF (per-page)
@@ -394,6 +401,15 @@ class ITunesTkApp:
         goto_btn = ttk.Button(playlist_toolbar, text="再生中へ", command=self.goto_current_track, width=10, takefocus=False)
         goto_btn.pack(side=tk.LEFT)
 
+        # プレイリスト検索（入力で一覧を絞り込み。Esc でクリア）
+        self.playlist_search_var = tk.StringVar()
+        self.playlist_search_var.trace_add("write", self._on_playlist_search_changed)
+        self.playlist_search_entry = ttk.Entry(
+            playlist_toolbar, textvariable=self.playlist_search_var,
+        )
+        self.playlist_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        self.playlist_search_entry.bind("<Escape>", self._on_playlist_search_escape)
+
         playlist_scroll = ttk.Scrollbar(self.playlist_frame)
         playlist_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -414,7 +430,18 @@ class ITunesTkApp:
         # トラック一覧
         self.track_frame_list = ttk.LabelFrame(self.middle_paned, text="トラック一覧")
         self.middle_paned.add(self.track_frame_list, weight=2)
-        
+
+        # トラック検索（曲名/アーティスト/アルバムで絞り込み。Esc でクリア）
+        track_toolbar = ttk.Frame(self.track_frame_list)
+        track_toolbar.pack(fill=tk.X, padx=4, pady=4)
+        self.track_search_var = tk.StringVar()
+        self.track_search_var.trace_add("write", self._on_track_search_changed)
+        self.track_search_entry = ttk.Entry(
+            track_toolbar, textvariable=self.track_search_var,
+        )
+        self.track_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.track_search_entry.bind("<Escape>", self._on_track_search_escape)
+
         track_scroll = ttk.Scrollbar(self.track_frame_list)
         track_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -1520,29 +1547,76 @@ class ITunesTkApp:
     def _apply_playlist_list(self, playlists):
         """get_playlists の結果をリストボックスへ反映（UIスレッド）"""
         try:
-            folder_map = self._get_playlist_folder_map()
             self._playlist_raw_names = []
-            self.playlist_listbox.delete(0, tk.END)
             for pl in playlists:
-                name = pl['name']
-                self._playlist_raw_names.append(name)
-                self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
+                self._playlist_raw_names.append(pl['name'])
+            self._rebuild_playlist_listbox(preserve_selection=False)
         except Exception as e:
             logger.error("プレイリスト読み込みエラー: %s", e)
 
     def _refresh_playlist_labels(self):
         """表示中プレイリスト一覧のラベルをキャッシュ済みXML情報で更新する（COM不使用）。
         XML読込完了後にフォルダパス付き表示へ追従するために使う。"""
+        self._rebuild_playlist_listbox()
+
+    def _visible_playlist_names(self) -> List[str]:
+        """リストボックスの行インデックスに対応する実プレイリスト名を返す。
+        フィルタ未適用（_playlist_visible_names 未構築）なら全件を返す。"""
+        names = getattr(self, "_playlist_visible_names", None)
+        if names is None:
+            return list(getattr(self, "_playlist_raw_names", None) or [])
+        return names
+
+    def _rebuild_playlist_listbox(self, preserve_selection: bool = True):
+        """_playlist_raw_names と検索クエリからリストボックスを再構築する。
+        表示行と _playlist_visible_names（行インデックス→実名）を同期させ、
+        preserve_selection 時は同じ実名の選択を維持する。"""
         try:
             folder_map = self._get_playlist_folder_map()
-            selected = set(self.playlist_listbox.curselection() or ())
+            selected_names = set()
+            if preserve_selection:
+                prev = self._visible_playlist_names()
+                for i in (self.playlist_listbox.curselection() or ()):
+                    try:
+                        if 0 <= i < len(prev):
+                            selected_names.add(prev[i])
+                    except Exception:
+                        continue
+            query = getattr(self, "_playlist_filter_query", "") or ""
+            self._playlist_visible_names = []
             self.playlist_listbox.delete(0, tk.END)
-            for i, name in enumerate(self._playlist_raw_names):
-                self.playlist_listbox.insert(tk.END, self._playlist_display_label(name, folder_map))
-                if i in selected:
-                    self.playlist_listbox.selection_set(i)
+            for name in self._playlist_raw_names:
+                label = self._playlist_display_label(name, folder_map)
+                if query and query not in label.casefold():
+                    continue
+                self.playlist_listbox.insert(tk.END, label)
+                if name in selected_names:
+                    self.playlist_listbox.selection_set(len(self._playlist_visible_names))
+                self._playlist_visible_names.append(name)
         except Exception as e:
-            logger.error("プレイリストラベル更新エラー: %s", e)
+            logger.error("プレイリスト一覧更新エラー: %s", e)
+
+    def _on_playlist_search_changed(self, *args):
+        """プレイリスト検索 Entry の入力変化 → 一覧を絞り込む"""
+        var = getattr(self, "playlist_search_var", None)
+        try:
+            query = (var.get() if var is not None else "") or ""
+        except Exception:
+            query = ""
+        self._playlist_filter_query = query.strip().casefold()
+        self._rebuild_playlist_listbox()
+
+    def _on_playlist_search_escape(self, event=None):
+        """Esc でプレイリスト検索をクリアして全件表示へ戻す"""
+        var = getattr(self, "playlist_search_var", None)
+        try:
+            if var is not None:
+                var.set("")
+        except Exception:
+            pass
+        self._playlist_filter_query = ""
+        self._rebuild_playlist_listbox()
+        return "break"
 
     def on_playlist_click(self, event):
         """シングルクリック: 再生せずに選択プレイリストのトラック一覧だけ表示する。
@@ -1567,7 +1641,7 @@ class ITunesTkApp:
             selection = self.playlist_listbox.curselection()
             if not selection:
                 return
-            playlist_name = self._playlist_raw_names[selection[0]]
+            playlist_name = self._visible_playlist_names()[selection[0]]
             self._manual_playlist_view = True
             self.load_tracks(playlist_name)
             self._log_action(f"トラック一覧表示: {playlist_name}")
@@ -1586,7 +1660,7 @@ class ITunesTkApp:
             selection = self.playlist_listbox.curselection()
             if not selection:
                 return
-            playlist_name = self._playlist_raw_names[selection[0]]
+            playlist_name = self._visible_playlist_names()[selection[0]]
 
             # トラック一覧の読み込み（バックグラウンド）。初回バッチが届いたら
             # 先頭行を再生する（_display_tracks_batch_sync で _pending_autoplay を消費）
@@ -1666,6 +1740,9 @@ class ITunesTkApp:
             self._track_tree_item_meta.clear()
         except Exception:
             pass
+        self._track_tree_order = []
+        # プレイリスト切替時はトラック検索フィルタをリセット（全件表示へ戻す）
+        self._clear_track_filter()
 
         # ワーカー起動（Tkに触らない）。キューとキャンセルイベントはこの世代のものを
         # クロージャで捕捉し、新世代に上書きされるインスタンス属性は遅延参照しない
@@ -1801,9 +1878,17 @@ class ITunesTkApp:
                     'purchase_date': purchase_date,
                     'play_order': int(track.get('play_order') or 0),
                 }
+                try:
+                    self._track_tree_order.append(iid)
+                except Exception:
+                    self._track_tree_order = [iid]
                 self.track_tree.tag_configure('playing', background='#e0f0ff')
             except Exception:
                 pass
+
+        # フィルタ適用中に届いた追加分も絞り込み対象にする
+        if getattr(self, "_track_filter_query", ""):
+            self._apply_track_filter()
 
         # プレイリスト選択時の先頭曲自動再生（on_playlist_select で保留した分）
         pending = getattr(self, "_pending_autoplay", None)
@@ -1858,7 +1943,96 @@ class ITunesTkApp:
                 self.track_tree.move(iid, '', idx)
             except Exception:
                 pass
-    
+
+        # フィルタ復帰用の全行順もソート後の順へ同期（非表示行は末尾に維持）
+        try:
+            order = getattr(self, "_track_tree_order", None)
+            if order is not None:
+                attached = set(items)
+                order[:] = items + [i for i in order if i not in attached]
+        except Exception:
+            pass
+
+    def _on_track_search_changed(self, *args):
+        """トラック検索 Entry の入力変化 → 一覧を絞り込む"""
+        self._apply_track_filter()
+
+    def _on_track_search_escape(self, event=None):
+        """Esc でトラック検索をクリアして全件表示へ戻す"""
+        self._clear_track_filter()
+        return "break"
+
+    def _clear_track_filter(self):
+        """トラック検索をクリアして全件表示へ戻す"""
+        var = getattr(self, "track_search_var", None)
+        try:
+            if var is not None:
+                var.set("")
+        except Exception:
+            pass
+        self._apply_track_filter()
+
+    def _track_row_matches(self, iid, query: str) -> bool:
+        """行が検索クエリに一致するか（曲名/アーティスト/アルバムの部分一致、大小無視）。
+        データは表示済み行の _track_tree_item_meta を使う（XML再解析はしない）。"""
+        if not query:
+            return True
+        meta = getattr(self, "_track_tree_item_meta", {}).get(iid) or {}
+        parts = [meta.get("name"), meta.get("artist"), meta.get("album")]
+        if not any(parts):
+            # メタ未取得の行はツリーの表示値（曲名/アーティスト/アルバム列）へフォールバック
+            try:
+                parts = [self.track_tree.item(iid, "text")]
+                values = self.track_tree.item(iid, "values") or ()
+                parts += list(values)[:2]
+            except Exception:
+                return False
+        haystack = " ".join(str(p) for p in parts if p).casefold()
+        return query in haystack
+
+    def _apply_track_filter(self):
+        """track_search_var のクエリで track_tree の表示行を絞り込む。
+
+        非一致行は detach で隠す（行データは保持）。一致行は _track_tree_order
+        の順へ move/reattach する。get_children は表示中の行のみを返すため、
+        フィルタ後の表示順が次/前遷移・自然終了遷移の基準になる。
+        """
+        tree = getattr(self, "track_tree", None)
+        if tree is None:
+            return
+        var = getattr(self, "track_search_var", None)
+        try:
+            query = (var.get() if var is not None else "") or ""
+        except Exception:
+            query = ""
+        query = query.strip().casefold()
+        self._track_filter_query = query
+
+        order = list(getattr(self, "_track_tree_order", None) or [])
+        try:
+            attached = set(tree.get_children(''))
+        except Exception:
+            attached = set()
+        if not order:
+            order = list(attached)
+
+        pos = 0
+        for iid in order:
+            if self._track_row_matches(iid, query):
+                try:
+                    if iid in attached:
+                        tree.move(iid, '', pos)
+                    else:
+                        tree.reattach(iid, '', pos)
+                except Exception:
+                    pass
+                pos += 1
+            elif iid in attached:
+                try:
+                    tree.detach(iid)
+                except Exception:
+                    pass
+
     def on_track_select(self, event):
         """トラック選択時（ダブルクリック）"""
         try:
@@ -2339,7 +2513,7 @@ class ITunesTkApp:
     def _select_playlist_in_listbox(self, playlist_name: str):
         """プレイリストリストボックスで指定名のプレイリストを選択状態にする"""
         try:
-            for i, raw in enumerate(self._playlist_raw_names):
+            for i, raw in enumerate(self._visible_playlist_names()):
                 if raw == playlist_name:
                     self.playlist_listbox.selection_clear(0, tk.END)
                     self.playlist_listbox.selection_set(i)
