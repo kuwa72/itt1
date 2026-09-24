@@ -567,28 +567,32 @@ class WindowsMusicController:
         戻り値: "added"（新規追加）, "already_exists"（既に存在）, False（失敗）
         """
         if not self.itunes:
+            logger.error("プレイリスト追加失敗: iTunesに接続されていません (%s)", playlist_name)
             return False
-        
+
         try:
             current_track = self.itunes.CurrentTrack
             if not current_track:
+                logger.error("プレイリスト追加失敗: 再生中のトラックがありません (%s)", playlist_name)
                 return False
-            
+
             target = self._find_playlist_by_name(playlist_name)
             if target is None:
+                logger.error("プレイリスト追加失敗: プレイリストが見つかりません: %s", playlist_name)
                 return False
-            
+
             # トラック情報を取得
             track_name = getattr(current_track, 'Name', None)
             track_dbid = getattr(current_track, 'TrackDatabaseID', None)
-            
+
             if not track_name or not isinstance(track_dbid, int):
                 # 情報が不足している場合は追加のみ試みる
                 if hasattr(target, 'AddTrack'):
                     target.AddTrack(current_track)
                     return "added"
+                logger.error("プレイリスト追加失敗: 対象がAddTrackをサポートしません: %s", playlist_name)
                 return False
-            
+
             # Search APIで重複チェック（超高速: 0.04秒）
             if hasattr(target, 'Search'):
                 try:
@@ -606,16 +610,17 @@ class WindowsMusicController:
                 except Exception:
                     # Search失敗時はフォールバック（後述）
                     pass
-            
+
             # 重複なし → 追加
             if hasattr(target, 'AddTrack'):
                 target.AddTrack(current_track)
                 return "added"
-            
+
+            logger.error("プレイリスト追加失敗: 対象がAddTrackをサポートしません: %s", playlist_name)
             return False
-            
+
         except Exception as e:
-            logger.error("プレイリスト追加エラー: %s", e)
+            logger.error("プレイリスト追加エラー (%s): %s", playlist_name, e)
             return False
     
     
@@ -677,8 +682,8 @@ class WindowsMusicController:
                         playlist = playlists.Item(j)
                         if playlist.Name == name:
                             return playlist
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("プレイリスト検索エラー (%s): %s", name, e)
         return None
 
     def get_all_playlists(self) -> List[str]:
