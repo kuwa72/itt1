@@ -5,6 +5,7 @@ from typing import List
 import logging
 import os
 import plistlib
+import re
 import sys
 import threading
 import time
@@ -112,14 +113,21 @@ class ITunesTkApp:
     # クラス既定値を置き、__init__ 未到達のインスタンスでも on_key 等が安全に参照できるようにする
     _closing: bool = False
     _modal_open: int = 0
+    # 初期ウィンドウサイズ/最小サイズ。クイックスロット枠（36ボタン/バンク、
+    # 高さ固定の Label 行）とログ枠が初期表示で収まる寸法を確保する
+    DEFAULT_GEOMETRY = "1040x860"
+    MIN_WINDOW_SIZE = (920, 780)
+    # config.json から復元した geometry 文字列の検証（壊れた値を geometry() に渡さない）
+    _GEOMETRY_RE = re.compile(r"\d+x\d+(?:[+-]\d+){0,2}")
 
     def __init__(self, root: tk.Tk, config: ConfigManager):
         self.root = root
         self.root.title("iTunes Controller (GUI)")
-        self.root.geometry("1040x720")
-        # Prevent excessive shrinking that may clip content
-        self.root.minsize(860, 600)
         self.config = config
+        # 前回終了時の geometry を config.json から復元（無ければ既定値）
+        self.root.geometry(self._initial_geometry())
+        # Prevent excessive shrinking that may clip content
+        self.root.minsize(*self.MIN_WINDOW_SIZE)
         self.ctrl = create_music_controller()
         # First-run only: if config file does NOT exist, auto-assign quick slots from existing playlists (top-first)
         cfg_exists = False
@@ -263,6 +271,17 @@ class ITunesTkApp:
         # Start update loop
         self.update_ui_loop()
 
+    def _initial_geometry(self) -> str:
+        """起動時のウィンドウ geometry。config.json の保存値が有効なら復元し、
+        未保存/不正値なら DEFAULT_GEOMETRY を返す"""
+        try:
+            saved = (self.config.get_window_geometry() or "").strip()
+        except Exception:
+            saved = ""
+        if saved and self._GEOMETRY_RE.fullmatch(saved):
+            return saved
+        return self.DEFAULT_GEOMETRY
+
     def build_ui(self):
         # メニューバー
         menubar = tk.Menu(self.root)
@@ -362,18 +381,6 @@ class ITunesTkApp:
         # 中央パネル（プレイリストとトラック）
         self.middle_paned = ttk.PanedWindow(container, orient=tk.HORIZONTAL)
         self.middle_paned.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-
-        # アクションログ（最終アクションの履歴。タイムスタンプ付きで末尾へ追記し、
-        # 直近 ACTION_LOG_MAX_ENTRIES 件を保持）
-        self.action_log_frame = ttk.LabelFrame(container, text="ログ")
-        self.action_log_frame.pack(fill=tk.X, pady=(6, 0))
-        self.action_log_listbox = tk.Listbox(
-            self.action_log_frame, height=5, exportselection=False,
-        )
-        self.action_log_listbox.pack(fill=tk.X, padx=4, pady=4)
-        # build_ui より前に記録された起動時メッセージを反映
-        for _entry in getattr(self, "_action_log", ()):
-            self.action_log_listbox.insert(tk.END, _entry)
 
         # プレイリスト一覧
         self.playlist_frame = ttk.LabelFrame(self.middle_paned, text="プレイリスト")
@@ -502,6 +509,18 @@ class ITunesTkApp:
         self.help_label = ttk.Label(self.help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
         self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
         # 表示/非表示は「表示」メニューの「ヘルプ」トグル（toggle_help）で切り替える
+
+        # アクションログ（最終アクションの履歴。タイムスタンプ付きで末尾へ追記し、
+        # 直近 ACTION_LOG_MAX_ENTRIES 件を保持）。最下部に配置する
+        self.action_log_frame = ttk.LabelFrame(container, text="ログ")
+        self.action_log_frame.pack(fill=tk.X, pady=(6, 0))
+        self.action_log_listbox = tk.Listbox(
+            self.action_log_frame, height=5, exportselection=False,
+        )
+        self.action_log_listbox.pack(fill=tk.X, padx=4, pady=4)
+        # build_ui より前に記録された起動時メッセージを反映
+        for _entry in getattr(self, "_action_log", ()):
+            self.action_log_listbox.insert(tk.END, _entry)
 
     def bind_keys(self):
         self.root.bind_all("<KeyPress>", self.on_key)
@@ -845,6 +864,14 @@ class ITunesTkApp:
             return
         self._closing = True
 
+        # ウィンドウ geometry を config.json へ保存（次回起動時に復元する）
+        try:
+            geom = self.root.geometry()
+            if geom:
+                self.config.set_window_geometry(geom)
+        except Exception:
+            pass
+
         # ログ枠転送ハンドラを外す（終了後にレコードがキューへ積まれ続けないように）
         try:
             handler = getattr(self, "_ui_log_handler", None)
@@ -932,10 +959,31 @@ class ITunesTkApp:
         except Exception:
             pass
 
+    def _pack_in_order(self, frame, successors, **kwargs):
+        """枠を固定順の位置へ再 pack する。
+
+        pack() は末尾追加のため pack_forget → pack だけだと枠が最下部へ
+        移動してしまう。直下に来るべき後続枠（successors）のうち現在 pack
+        管理下にある最初の枠の前へ `before=` で挿入し、後続が無ければ末尾へ pack。
+        """
+        for succ in successors:
+            try:
+                if succ is not None and succ.winfo_manager():
+                    frame.pack(before=succ, **kwargs)
+                    return
+            except Exception:
+                continue
+        frame.pack(**kwargs)
+
     def toggle_help(self):
         """ヘルプ表示のトグル（LabelFrame ごと切替。空枠が残らないよう toggle_log と同じ挙動）"""
         if self.help_visible.get():
-            self.help_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
+            # ヘルプの直下はログ枠（最下部）。ログ表示中はその前へ挿入して位置を固定する
+            self._pack_in_order(
+                self.help_frame,
+                (getattr(self, "action_log_frame", None),),
+                fill=tk.X, expand=False, pady=(10, 0),
+            )
         else:
             self.help_frame.pack_forget()
 
@@ -2086,12 +2134,19 @@ class ITunesTkApp:
     # トグルメソッド
     def toggle_slots(self):
         if self.show_slots.get():
-            self.slots_frame.pack(fill=tk.X, pady=(10, 0))
+            # スロットの直下はヘルプ→ログの順。表示中の後続枠の前へ挿入して位置を固定する
+            self._pack_in_order(
+                self.slots_frame,
+                (getattr(self, "help_frame", None),
+                 getattr(self, "action_log_frame", None)),
+                fill=tk.X, pady=(10, 0),
+            )
         else:
             self.slots_frame.pack_forget()
 
     def toggle_log(self):
         if self.show_log.get():
+            # ログは常に最下段のため before 指定なし（末尾 pack）で正しい位置に戻る
             self.action_log_frame.pack(fill=tk.X, pady=(6, 0))
         else:
             self.action_log_frame.pack_forget()

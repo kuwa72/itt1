@@ -44,6 +44,11 @@ class AppConfig(BaseModel):
         description="macOS Music/iTunesのライブラリXMLパス（未設定の場合は標準パスを探索）"
     )
 
+    window_geometry: str = Field(
+        default="",
+        description="終了時のウィンドウジオメトリ（例: '1040x860+100+50'。空は未保存）"
+    )
+
 
 class ConfigManager:
     """設定ファイル管理"""
@@ -81,6 +86,15 @@ class ConfigManager:
     def set_quick_slots(self, slots: List[str]):
         """クイックスロットを設定して保存"""
         self.config.quick_slots = list(slots)
+        self.save_config()
+
+    def get_window_geometry(self) -> str:
+        """保存済みウィンドウジオメトリを返す（未保存なら空文字）"""
+        return self.config.window_geometry or ""
+
+    def set_window_geometry(self, geometry: str):
+        """ウィンドウジオメトリを設定して保存"""
+        self.config.window_geometry = geometry
         self.save_config()
 
     def _detect_platform_name(self) -> str:
