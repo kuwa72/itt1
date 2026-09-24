@@ -23,7 +23,13 @@ investigate_*.bat
 # PyInstaller
 build/
 dist/
-*.spec
+
+# libmpv（build.ps1 がダウンロード。巨大なためコミットしない）
+libmpv-2.dll
+
+# スパイク/診断用の作業ファイル
+_spike_*
+_diag_*
 
 # Virtualenv
 .venv/

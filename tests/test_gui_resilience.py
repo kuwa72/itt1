@@ -148,38 +148,31 @@ def test_on_key_ignores_keys_when_entry_focused():
 
 
 # --- WindowsMusicController COM calls ---
+# Issue #39: 再生系メソッドは削除済み。残るのはプレイリスト管理のみ。
 
-@pytest.mark.parametrize("method_name,com_name", [
-    ("play_pause", "PlayPause"),
-    ("play_next_track", "NextTrack"),
-    ("play_previous_track", "PreviousTrack"),
-])
-def test_com_method_calls_itunes(method_name, com_name):
+def test_create_playlist_calls_itunes():
     ctrl = WindowsMusicController.__new__(WindowsMusicController)
     ctrl.itunes = MagicMock(name="itunes")
-    getattr(ctrl, method_name)()
-    getattr(ctrl.itunes, com_name).assert_called_once()
+    assert ctrl.create_playlist("PL") is True
+    ctrl.itunes.CreatePlaylist.assert_called_once_with("PL")
 
 
-@pytest.mark.parametrize("method_name,com_name", [
-    ("play_pause", "PlayPause"),
-    ("play_next_track", "NextTrack"),
-    ("play_previous_track", "PreviousTrack"),
-])
-def test_com_method_error_does_not_propagate(method_name, com_name, caplog):
+def test_create_playlist_error_does_not_propagate(caplog):
     """一時的な com_error が呼出し側(Tkコールバック)に伝播しない"""
     ctrl = WindowsMusicController.__new__(WindowsMusicController)
     ctrl.itunes = MagicMock(name="itunes")
-    getattr(ctrl.itunes, com_name).side_effect = RuntimeError("com_error: RPC_E_CALL_REJECTED")
+    ctrl.itunes.CreatePlaylist.side_effect = RuntimeError("com_error: RPC_E_CALL_REJECTED")
     with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
-        getattr(ctrl, method_name)()  # 例外が伝播しないこと
+        assert ctrl.create_playlist("PL") is False
     assert any("RPC_E_CALL_REJECTED" in r.message for r in caplog.records)
 
 
-@pytest.mark.parametrize("method_name", [
-    "play_pause", "play_next_track", "play_previous_track",
+@pytest.mark.parametrize("method_name,args", [
+    ("get_playlists", ()),
+    ("create_playlist", ("PL",)),
+    ("add_to_playlist", ("PL", 1, "n")),
 ])
-def test_com_method_noop_when_disconnected(method_name):
+def test_com_method_noop_when_disconnected(method_name, args):
     ctrl = WindowsMusicController.__new__(WindowsMusicController)
     ctrl.itunes = None
-    getattr(ctrl, method_name)()  # 例外にならないこと
+    getattr(ctrl, method_name)(*args)  # 例外にならないこと

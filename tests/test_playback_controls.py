@@ -1,11 +1,11 @@
-"""Issue #25: 再生コントロールUI（⏮/⏯/⏭ + 音量スライダー）と音量API契約のテスト。
+"""再生コントロールUI（⏮/⏯/⏭ + 音量スライダー + シークバー）のテスト。
 
-- Windows/macOS 両コントローラーが get_volume()/set_volume(level) を公開する
-  - Windows: itunes.SoundVolume の get/set（0-100 int、例外は None/False）
-  - macOS:   AppleScript `sound volume` の get/set
-- GUI の再生コントロールはUIスレッドでCOMを呼ばず _com_submit 経由
-- 音量スライダーはシークバーと同じデバウンスパターンで set_volume を投入
-- ポーリング結果の volume は _apply_track_info でスライダー/ラベルへ反映するが、
+Issue #39: 再生操作は全てローカル再生エンジン（playback_engine）へ委譲される。
+- 再生/一時停止 → engine.toggle_pause()
+- ±N秒スキップ → engine.seek_rel()
+- シークバー → engine.seek_abs()
+- 音量スライダー → デバウンス後に engine.set_volume()
+- エンジン状態の volume は _apply_track_info でスライダー/ラベルへ反映するが、
   ドラッグ中（_volume_seeking）はユーザー操作を優先して上書きしない
 
 tkinter は conftest.py のフェイクモジュール経由。
@@ -13,131 +13,22 @@ ITunesTkApp は __init__ を通さず __new__ + 必要属性の代入で生成�
 """
 
 import queue
-import threading
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from gui_tk import ITunesTkApp
-from music_controller_base import MacOSMusicController
-from music_controller_windows import WindowsMusicController
 
-
-# --- コントローラーAPI契約 ---
-
-def _make_windows_ctrl() -> WindowsMusicController:
-    """__init__（COM接続）を通さず self.itunes だけ注入したインスタンスを返す。"""
-    ctrl = WindowsMusicController.__new__(WindowsMusicController)
-    ctrl.itunes = MagicMock(name="itunes")
-    return ctrl
-
-
-@pytest.mark.parametrize("cls", [WindowsMusicController, MacOSMusicController])
-@pytest.mark.parametrize("method", ["get_volume", "set_volume"])
-def test_controller_exposes_volume_api(cls, method):
-    assert callable(getattr(cls, method, None)), (
-        f"{cls.__name__}.{method} が存在しない（gui_tk が依存）"
-    )
-
-
-class TestWindowsVolume:
-    def test_get_volume_reads_sound_volume(self):
-        ctrl = _make_windows_ctrl()
-        ctrl.itunes.SoundVolume = 62
-        assert ctrl.get_volume() == 62
-
-    def test_get_volume_returns_none_when_disconnected(self):
-        ctrl = _make_windows_ctrl()
-        ctrl.itunes = None
-        assert ctrl.get_volume() is None
-
-    def test_get_volume_returns_none_on_com_error(self):
-        ctrl = _make_windows_ctrl()
-        type(ctrl.itunes).SoundVolume = property(
-            fget=MagicMock(side_effect=RuntimeError("com_error")),
-            fset=MagicMock(),
-        )
-        assert ctrl.get_volume() is None
-
-    def test_set_volume_writes_sound_volume(self):
-        ctrl = _make_windows_ctrl()
-        assert ctrl.set_volume(40) is True
-        assert ctrl.itunes.SoundVolume == 40
-
-    def test_set_volume_clips_to_range(self):
-        ctrl = _make_windows_ctrl()
-        ctrl.set_volume(150)
-        assert ctrl.itunes.SoundVolume == 100
-        ctrl.set_volume(-5)
-        assert ctrl.itunes.SoundVolume == 0
-
-    def test_set_volume_returns_false_when_disconnected(self):
-        ctrl = _make_windows_ctrl()
-        ctrl.itunes = None
-        assert ctrl.set_volume(50) is False
-
-    def test_set_volume_returns_false_on_com_error(self):
-        ctrl = _make_windows_ctrl()
-        type(ctrl.itunes).SoundVolume = property(
-            fget=MagicMock(return_value=0),
-            fset=MagicMock(side_effect=RuntimeError("com_error")),
-        )
-        assert ctrl.set_volume(50) is False
-
-
-class TestMacOSVolume:
-    def test_get_volume_runs_sound_volume_script(self):
-        ctrl = MacOSMusicController()
-        with patch.object(ctrl, "_run_applescript", return_value="62") as run:
-            assert ctrl.get_volume() == 62
-        assert "sound volume" in run.call_args[0][0]
-
-    def test_get_volume_returns_none_on_error(self):
-        ctrl = MacOSMusicController()
-        with patch.object(
-            ctrl, "_run_applescript", side_effect=RuntimeError("osascript failed")
-        ):
-            assert ctrl.get_volume() is None
-
-    def test_get_volume_returns_none_on_bad_output(self):
-        ctrl = MacOSMusicController()
-        with patch.object(ctrl, "_run_applescript", return_value="not-a-number"):
-            assert ctrl.get_volume() is None
-
-    def test_set_volume_runs_set_script(self):
-        ctrl = MacOSMusicController()
-        with patch.object(ctrl, "_run_applescript", return_value="") as run:
-            assert ctrl.set_volume(40) is True
-        script = run.call_args[0][0]
-        assert "set sound volume to 40" in script
-
-    def test_set_volume_clips_to_range(self):
-        ctrl = MacOSMusicController()
-        with patch.object(ctrl, "_run_applescript", return_value="") as run:
-            ctrl.set_volume(150)
-        assert "set sound volume to 100" in run.call_args[0][0]
-
-    def test_set_volume_returns_false_on_error(self):
-        ctrl = MacOSMusicController()
-        with patch.object(
-            ctrl, "_run_applescript", side_effect=RuntimeError("osascript failed")
-        ):
-            assert ctrl.set_volume(40) is False
-
-
-# --- GUI ---
 
 def _make_app() -> ITunesTkApp:
-    """COMワーカースレッドは起動しないテスト用インスタンス。
-    キューと音量スライダー関連ウィジェットだけ用意する。
-    """
+    """エンジンをモック化したテスト用インスタンス。"""
     app = ITunesTkApp.__new__(ITunesTkApp)
     app.root = MagicMock(name="root")
     app.ctrl = MagicMock(name="ctrl")
-    app.ctrl.get_current_track_info.return_value = {}
+    app.engine = MagicMock(name="engine")
     app.config = MagicMock(name="config")
     app.config.config.refresh_interval = 0.5
+    app.config.config.skip_seconds = 10
     app.track_status = MagicMock(name="track_status")
     app.track_title = MagicMock(name="track_title")
     app.track_artist = MagicMock(name="track_artist")
@@ -147,15 +38,15 @@ def _make_app() -> ITunesTkApp:
     app.volume_scale = MagicMock(name="volume_scale")
     app.volume_label = MagicMock(name="volume_label")
     app.last_action = "-"
+    app._action_log = deque(maxlen=50)
+    app.action_log_listbox = None
     app._seeking = False
     app._synced_dbid = None
     app._synced_playlist = None
     app._closing = False
-    app._pending_after_ids = set()
     app._ui_queue = queue.Queue()
-    app._com_task_queue = queue.Queue()
-    app._com_worker_stop = threading.Event()
     app._latest_track_info = None
+    app._current_track_meta = None
     # シーク/音量デバウンス
     app._seek_pending_value = None
     app._seek_after_id = None
@@ -163,65 +54,100 @@ def _make_app() -> ITunesTkApp:
     app._volume_pending_value = None
     app._volume_after_id = None
     app._playback_playlist = None
+    app._after = MagicMock(name="_after", side_effect=lambda ms, fn: "after-id")
     return app
 
 
-# --- 再生ボタン: COMワーカー経由 ---
+# --- 再生/一時停止・スキップ: エンジン直接呼出し ---
 
-def test_toggle_play_pause_submits_to_com_worker():
-    """再生/一時停止ボタンはUIスレッドでCOMを呼ばず play_pause タスクを投入する"""
+def test_toggle_play_pause_calls_engine():
     app = _make_app()
 
     app.toggle_play_pause()
 
-    app.ctrl.play_pause.assert_not_called()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert fn == "play_pause"
+    app.engine.toggle_pause.assert_called_once_with()
 
 
-def test_next_track_button_submits_with_playlist_context():
+def test_toggle_play_pause_noop_without_engine():
+    """エンジンが無い環境でも例外を投げない"""
     app = _make_app()
-    app._playback_playlist = "PL"
+    app.engine = None
 
-    app.next_track()
-
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("play_next_track", ("PL",))
+    app.toggle_play_pause()
 
 
-def test_prev_track_button_submits_with_playlist_context():
+def test_skip_forward_calls_engine_seek_rel():
     app = _make_app()
-    app._playback_playlist = "PL"
 
-    app.prev_track()
+    app.skip_forward()
 
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("play_previous_track", ("PL",))
+    app.engine.seek_rel.assert_called_once_with(10)
 
 
-# --- 音量スライダー: デバウンス ---
+def test_skip_backward_calls_engine_seek_rel_negative():
+    app = _make_app()
+
+    app.skip_backward()
+
+    app.engine.seek_rel.assert_called_once_with(-10)
+
+
+# --- シークバー: デバウンス → engine.seek_abs ---
+
+def test_flush_pending_seek_calls_engine_seek_abs():
+    """シークバー操作はデバウンス後に engine.seek_abs(秒) へ変換される"""
+    app = _make_app()
+    app._latest_track_info = {"duration": 200}
+    app._seek_pending_value = 50.0  # 50%
+
+    app._flush_pending_seek()
+
+    app.engine.seek_abs.assert_called_once_with(100.0)
+
+
+def test_flush_pending_seek_is_idempotent():
+    """発火済みのデバウンスコールバックが残っていても二重シークしない"""
+    app = _make_app()
+    app._latest_track_info = {"duration": 200}
+    app._seek_pending_value = 50.0
+
+    app._flush_pending_seek()
+    app._flush_pending_seek()  # pending値は消費済み → 何もしない
+
+    app.engine.seek_abs.assert_called_once()
+
+
+def test_flush_pending_seek_noop_without_duration():
+    """duration 不明（未再生）では seek しない"""
+    app = _make_app()
+    app._latest_track_info = {"duration": 0}
+    app._seek_pending_value = 50.0
+
+    app._flush_pending_seek()
+
+    app.engine.seek_abs.assert_not_called()
+
+
+# --- 音量スライダー: デバウンス → engine.set_volume ---
 
 def _fake_event(x):
     return SimpleNamespace(x=x)
 
 
-def test_on_volume_change_debounces_and_offloads_set_volume():
-    """ドラッグ中の連続イベントはデバウンスされ、set_volume はワーカー経由で1回だけ"""
+def test_on_volume_change_debounces_to_engine():
+    """ドラッグ中の連続イベントはデバウンスされ、set_volume は1回だけ"""
     app = _make_app()
     app._volume_seeking = True
 
     for v in (10, 20, 30, 40, 50):
         app.on_volume_change(v)
 
-    # UIスレッドではCOMを呼ばない
-    app.ctrl.set_volume.assert_not_called()
     # 先行スケジュールはキャンセルされ、最後の1発だけが残る
     assert app.root.after_cancel.call_count == 4
-    assert app.root.after.call_args[0][0] == app.SEEK_DEBOUNCE_MS
+    assert app._after.call_args[0][0] == app.SEEK_DEBOUNCE_MS
 
     app._flush_pending_volume()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("set_volume", (50,))
+    app.engine.set_volume.assert_called_once_with(50)
 
 
 def test_on_volume_change_ignores_when_not_seeking():
@@ -231,8 +157,8 @@ def test_on_volume_change_ignores_when_not_seeking():
 
     app.on_volume_change(50)
 
-    app.root.after.assert_not_called()
-    app.ctrl.set_volume.assert_not_called()
+    app._after.assert_not_called()
+    app.engine.set_volume.assert_not_called()
 
 
 def test_flush_pending_volume_is_idempotent():
@@ -243,7 +169,7 @@ def test_flush_pending_volume_is_idempotent():
     app._flush_pending_volume()
     app._flush_pending_volume()  # pending値は消費済み → 何もしない
 
-    assert app._com_task_queue.qsize() == 1
+    app.engine.set_volume.assert_called_once_with(30)
 
 
 def test_flush_pending_volume_rounds_and_clips():
@@ -252,13 +178,11 @@ def test_flush_pending_volume_rounds_and_clips():
     app._volume_pending_value = "62.4"  # ttk.Scale command は文字列で渡す
 
     app._flush_pending_volume()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("set_volume", (62,))
+    app.engine.set_volume.assert_called_once_with(62)
 
     app._volume_pending_value = 120.0
     app._flush_pending_volume()
-    fn, args, kwargs, tag = app._com_task_queue.get_nowait()
-    assert (fn, args) == ("set_volume", (100,))
+    app.engine.set_volume.assert_called_with(100)
 
 
 def test_volume_press_seeks_to_click_position():
@@ -296,31 +220,35 @@ def test_volume_release_clears_seeking_flag():
     assert app._volume_seeking is False
 
 
-# --- ポーリング → UI反映 ---
+# --- エンジン状態 → UI反映 ---
 
-def test_poll_track_info_includes_volume():
-    """COMワーカーのポーリングは get_volume も取得して同じメッセージに同梱する"""
+def test_poll_engine_builds_info_from_engine_and_meta():
+    """_poll_engine はエンジン状態 + 再生中メタ情報から表示用 info を合成する"""
     app = _make_app()
-    app.ctrl.get_current_track_info.return_value = {"dbid": 7}
-    app.ctrl.get_volume.return_value = 62
+    app._current_track_meta = {"dbid": 7, "name": "n", "artist": "a", "album": "al"}
+    app.engine.get_state.return_value = {
+        "position": 12.5, "duration": 180.0, "is_playing": True, "volume": 62.0,
+    }
 
-    app._poll_track_info(app.ctrl)
+    app._poll_engine()
 
-    assert app._ui_queue.get_nowait() == ("track_info", {"dbid": 7, "volume": 62})
-
-
-def test_poll_track_info_tolerates_missing_volume_api():
-    """get_volume を持たない/失敗するコントローラーでもポーリング自体は継続"""
-    app = _make_app()
-    app.ctrl.get_current_track_info.return_value = {"dbid": 7}
-    app.ctrl.get_volume.side_effect = RuntimeError("no volume")
-
-    app._poll_track_info(app.ctrl)
-
-    kind, info = app._ui_queue.get_nowait()
-    assert kind == "track_info"
+    info = app._latest_track_info
     assert info["dbid"] == 7
-    assert info["volume"] is None
+    assert info["position"] == 12.5
+    assert info["duration"] == 180.0
+    assert info["is_playing"] is True
+    assert info["volume"] == 62.0
+
+
+def test_poll_engine_tolerates_missing_engine():
+    """エンジンが無い/失敗してもポーリング自体は継続"""
+    app = _make_app()
+    app.engine = None
+
+    app._poll_engine()
+
+    assert app._latest_track_info["is_playing"] is False
+    assert app._latest_track_info["volume"] is None
 
 
 def test_apply_track_info_applies_volume_to_widgets():

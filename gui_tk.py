@@ -10,6 +10,7 @@ import threading
 import time
 import queue
 from music_controller_base import create_music_controller
+from playback_engine import LocalPlaybackEngine, itunes_location_to_path
 from config import ConfigManager
 
 logger = logging.getLogger(__name__)
@@ -200,13 +201,12 @@ class ITunesTkApp:
         # 曲変更検知用
         self._synced_dbid: int | None = None
         self._synced_playlist: str | None = None
-        # 再生コンテキストのプレイリスト名（次/前曲遷移でプレイリスト内隣接曲へ進むための情報。
-        # play_track_by_ids / play_playlist の成功時に _handle_task_result で更新される）
+        # 再生コンテキストのプレイリスト名（_play_tree_item で再生した行の所属一覧）
         self._playback_playlist: str | None = None
-        # 自然終了検知（Issue #37）: 直前ポーリング状態と手動遷移の帳簿
-        self._prev_track_info: dict | None = None
-        self._expected_dbid: int | None = None
-        self._suppress_track_correction: bool = False
+        # ローカル再生エンジンが現在再生中の行のメタ情報
+        self._current_track_meta: dict | None = None
+        # プレイリスト選択時の先頭曲自動再生（load_tracks の初回バッチで実行）
+        self._pending_autoplay: str | None = None
 
         # update_ui_loop の連続失敗カウンタ（バックオフ用）
         self._update_loop_failures = 0
@@ -235,7 +235,18 @@ class ITunesTkApp:
         self._volume_pending_value: float | None = None
         self._volume_after_id = None
 
-        # COMワーカー起動（トラック情報ポーリングとCOMタスク実行を1スレッドに集約）
+        # ローカル再生エンジン（libmpv）。失敗時は再生機能なしで起動を継続する
+        self.engine: LocalPlaybackEngine | None = None
+        try:
+            self.engine = LocalPlaybackEngine()
+            self.engine.on_end_file(
+                lambda reason, error: self._ui_put("engine_eof", reason, error)
+            )
+        except Exception as e:
+            logger.error("再生エンジン初期化失敗: %s", e)
+            self._log_action(f"再生エンジンなし: {e}")
+
+        # COMワーカー起動（プレイリスト一覧・追加などのCOM操作を専用スレッドに集約）
         self._start_com_worker()
         # ライブラリXMLをバックグラウンドで先読み（起動直後の操作を速くする）
         self._ensure_library_xml_load_started()
@@ -251,9 +262,6 @@ class ITunesTkApp:
 
         # Start update loop
         self.update_ui_loop()
-
-        # 起動直後にiTunesの再生状態をUIに反映
-        self._after(300, self._sync_to_itunes_state)
 
     def build_ui(self):
         # メニューバー
@@ -556,13 +564,12 @@ class ITunesTkApp:
             self._com_worker_thread = None
 
     def _com_worker_loop(self):
-        """COM操作専用ループ。タスク実行とトラック情報ポーリングを行う。
+        """COM操作専用ループ。プレイリスト操作などのCOMタスクを実行する。
 
         - タスクキューに (fn, args, kwargs, result_tag) が来れば実行。
           fn が文字列ならワーカー用コントローラーのメソッド名として解決する。
-        - タイムアウト（refresh_interval 経過）時は get_current_track_info を
-          ポーリングして ("track_info", info) を _ui_queue へ積む。
         - result_tag があれば ("task_result", tag, result) を _ui_queue へ積む。
+        - 再生状態のポーリングは行わない（再生はローカルエンジンが担う。Issue #39）
         """
         ctrl = self.ctrl
         try:
@@ -575,21 +582,13 @@ class ITunesTkApp:
         try:
             while not self._com_worker_stop.is_set() and not getattr(self, "_closing", False):
                 try:
-                    interval = float(self.config.config.refresh_interval)
-                except Exception:
-                    interval = 0.5
-                interval = max(0.1, interval)
-                try:
-                    task = self._com_task_queue.get(timeout=interval)
+                    task = self._com_task_queue.get(timeout=0.5)
                 except queue.Empty:
-                    task = None
+                    continue
                 try:
                     if task is _COM_STOP:
                         break
-                    if task is None:
-                        self._poll_track_info(ctrl)
-                    else:
-                        self._execute_com_task(ctrl, task)
+                    self._execute_com_task(ctrl, task)
                 except Exception as e:
                     logger.error("COMワーカー処理エラー: %s", e)
         finally:
@@ -601,28 +600,6 @@ class ITunesTkApp:
                         close()
                     except Exception:
                         pass
-
-    def _poll_track_info(self, ctrl):
-        """ワーカースレッド側: トラック情報と音量を取得してUIキューへ積む"""
-        try:
-            info = ctrl.get_current_track_info()
-        except Exception as e:
-            logger.error("トラック情報ポーリングエラー: %s", e)
-            info = None
-        # 音量はトラック情報と同じポーリングに同梱する（結果dictの volume キー）。
-        # get_volume を持たないコントローラーや取得失敗時は None のまま送る
-        try:
-            get_volume = getattr(ctrl, "get_volume", None)
-            volume = get_volume() if callable(get_volume) else None
-        except Exception as e:
-            logger.error("音量ポーリングエラー: %s", e)
-            volume = None
-        if isinstance(info, dict):
-            info = dict(info)
-            info["volume"] = volume
-        elif volume is not None:
-            info = {"volume": volume}
-        self._ui_put("track_info", info)
 
     def _execute_com_task(self, ctrl, task):
         """ワーカースレッド側: COMタスクを1件実行し、必要なら結果をUIキューへ返す"""
@@ -685,8 +662,6 @@ class ITunesTkApp:
         q = getattr(self, "_ui_queue", None)
         if q is None:
             return
-        info_seen = False
-        latest_info = None
         processed = 0
         while processed < 20:
             try:
@@ -696,9 +671,8 @@ class ITunesTkApp:
             processed += 1
             try:
                 kind = msg[0]
-                if kind == "track_info":
-                    info_seen = True
-                    latest_info = msg[1]
+                if kind == "engine_eof":
+                    self._on_engine_eof(msg[1], msg[2])
                 elif kind == "task_result":
                     self._handle_task_result(msg[1], msg[2])
                 elif kind == "log":
@@ -707,9 +681,6 @@ class ITunesTkApp:
                     self._on_library_xml_loaded(msg[1])
             except Exception as e:
                 logger.error("UIキュー処理エラー: %s", e)
-        if info_seen:
-            self._latest_track_info = latest_info or {}
-            self._apply_track_info(self._latest_track_info)
 
     def _handle_task_result(self, tag, result):
         """COMタスクの結果をUIへ反映（UIスレッド）"""
@@ -720,20 +691,7 @@ class ITunesTkApp:
             if isinstance(tag, tuple) and tag:
                 kind = tag[0]
                 name = tag[1] if len(tag) > 1 else None
-                if kind == "play_track":
-                    self._log_action(
-                        f"トラック再生: {name or '-'}" if result else "トラック再生失敗"
-                    )
-                    if result:
-                        # 再生コンテキストを記録（tag[2] にプレイリスト名。
-                        # 無ければライブラリ/不明コンテキストなのでクリア）
-                        self._playback_playlist = tag[2] if len(tag) > 2 else None
-                elif kind == "play_playlist":
-                    if result:
-                        self._playback_playlist = name
-                    else:
-                        self._log_action(f"プレイリスト再生失敗: {name or '-'}")
-                elif kind == "add_to_playlist":
+                if kind == "add_to_playlist":
                     widget_idx = tag[2] if len(tag) > 2 else None
                     self._apply_add_result(name, widget_idx, result)
         except Exception as e:
@@ -780,9 +738,49 @@ class ITunesTkApp:
         except Exception:
             pass
 
+    def _poll_engine(self):
+        """ローカル再生エンジンの状態を読み取り _apply_track_info へ反映する。
+        mpv のプロパティ読みはプロセス内呼出しのためUIスレッドで直接行える。"""
+        meta = getattr(self, "_current_track_meta", None) or {}
+        engine = getattr(self, "engine", None)
+        st = engine.get_state() if engine is not None else {}
+        info = {
+            "name": meta.get("name", "-"),
+            "artist": meta.get("artist", "-"),
+            "album": meta.get("album", "-"),
+            "dbid": meta.get("dbid"),
+            "playlist": getattr(self, "_playback_playlist", None),
+            "position": st.get("position") or 0,
+            "duration": st.get("duration") or meta.get("duration") or 0,
+            "is_playing": st.get("is_playing", False),
+            "volume": st.get("volume"),
+        }
+        self._latest_track_info = info
+        self._apply_track_info(info)
+
+    def _on_engine_eof(self, reason, error):
+        """再生エンジンの end-file イベント（UIスレッド）。
+
+        "eof"（自然終了）と "error"（ファイル読込/デコード失敗）のとき、
+        トラック一覧の次の行を再生する。コントローラーがプレイヤーなので
+        再生順は常にこの一覧の表示順に従う（Issue #39）。
+        """
+        if self._closing:
+            return
+        meta = getattr(self, "_current_track_meta", None) or {}
+        dbid = meta.get("dbid")
+        if reason == "eof":
+            if dbid is not None:
+                self._play_next_row_after(dbid)
+        elif reason == "error":
+            name = meta.get("name") or "-"
+            logger.error("再生エラー: %s (error=%s)", name, error)
+            self._log_action(f"再生エラー: {name}")
+            if dbid is not None:
+                self._play_next_row_after(dbid)
+
     def _apply_track_info(self, info):
-        """ポーリング済みのトラック情報をウィジェットへ反映（UIスレッド。COM不使用）"""
-        self._handle_track_transition(info or {})
+        """トラック情報をウィジェットへ反映（UIスレッド）"""
         if not info:
             return
         # 音量はポーリング値へ追従するが、ドラッグ中はユーザー操作を優先して上書きしない
@@ -821,69 +819,20 @@ class ITunesTkApp:
             self._synced_playlist = cur_playlist
             self._on_track_changed(cur_playlist, cur_dbid)
 
-    def _handle_track_transition(self, info: dict):
-        """自然終了時にトラック一覧の次の行を再生する（Issue #37）。
-
-        直前ポーリングが「再生中かつ末尾2秒以内」のとき:
-        - iTunes が別の曲に進んだ → 一覧の次の行と一致しなければ補正して再生
-        - 再生が止まった（キュー枯渇）→ 一覧の次の行を再生
-        手動遷移（次/前・ダブルクリック・フォールバック）は _expected_dbid /
-        _suppress_track_correction で補正対象外とする。
-        """
-        prev = getattr(self, "_prev_track_info", None)
-        self._prev_track_info = info
-        if not isinstance(prev, dict) or not isinstance(info, dict):
-            return
-        prev_dbid = prev.get("dbid")
-        if prev_dbid is None:
-            return
-        cur_dbid = info.get("dbid")
-
-        ended = bool(prev.get("is_playing")) and (
-            (prev.get("duration") or 0) - (prev.get("position") or 0) <= 2
-        )
-        changed = cur_dbid is not None and cur_dbid != prev_dbid
-        stopped_at_end = (
-            (cur_dbid is None or cur_dbid == prev_dbid)
-            and prev.get("is_playing")
-            and not info.get("is_playing")
-        )
-
-        if changed:
-            if getattr(self, "_suppress_track_correction", False):
-                self._suppress_track_correction = False
-                return
-            expected = getattr(self, "_expected_dbid", None)
-            if expected is not None:
-                self._expected_dbid = None
-                if cur_dbid == expected:
-                    return
-            if not ended:
-                # 途中での曲変更 = iTunes 側の手動操作等 → 追従（補正しない）
-                return
-            self._play_next_in_list_after(prev_dbid, cur_dbid)
-        elif stopped_at_end and ended:
-            self._play_next_in_list_after(prev_dbid, None)
-
-    def _play_next_in_list_after(self, ended_dbid, current_dbid=None) -> bool:
-        """自然終了した曲の一覧上の次の行を再生する。
-        iTunes が既にその曲へ進んでいる場合は何もせず True。
+    def _play_next_row_after(self, ended_dbid) -> bool:
+        """終了した曲の一覧上の次の行を再生する。
         一覧に無い/末尾の場合は False（何もしない）。"""
         try:
-            if getattr(self, "_com_task_queue", None) is None:
-                return False
             items = list(self.track_tree.get_children(''))
             for pos, iid in enumerate(items):
                 if self._item_dbid(iid) == ended_dbid:
                     nxt = pos + 1
                     if nxt >= len(items):
                         return False
-                    if current_dbid is not None and self._item_dbid(items[nxt]) == current_dbid:
-                        return True
                     return self._play_tree_item(items[nxt])
             return False
         except Exception as e:
-            logger.error("自然終了遷移エラー: %s", e)
+            logger.error("次行遷移エラー: %s", e)
             return False
 
     def on_closing(self):
@@ -961,6 +910,14 @@ class ITunesTkApp:
                 pass
         self._pending_after_ids = set()
         self._playlist_click_after_id = None
+
+        # 再生エンジンを停止（mpv 終了）
+        try:
+            engine = getattr(self, "engine", None)
+            if engine is not None:
+                engine.close()
+        except Exception:
+            pass
 
         # メインスレッドで CoInitialize 済みの COM を解放（コントローラーが対応していれば）
         try:
@@ -1079,55 +1036,55 @@ class ITunesTkApp:
 
     # Actions
     def toggle_play_pause(self):
-        # PlayPause は軽いCOM呼出しだが、UIスレッドでのCOM実行を避ける方針(#5)に
-        # 合わせて next_track/prev_track と同じくCOMワーカーへ委譲する
-        if getattr(self, "_com_task_queue", None) is not None:
-            self._com_submit("play_pause")
-        else:
-            self.ctrl.play_pause()
+        # 再生/一時停止はローカル再生エンジンで行う（Issue #39）
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            self._log_action("再生エンジンがありません")
+            return
+        try:
+            engine.toggle_pause()
+        except Exception as e:
+            logger.error("再生/一時停止エラー: %s", e)
         self._log_action("再生/一時停止")
 
     def skip_forward(self):
-        self.ctrl.skip_forward(self.config.config.skip_seconds)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            try:
+                engine.seek_rel(self.config.config.skip_seconds)
+            except Exception as e:
+                logger.error("スキップエラー: %s", e)
         self._log_action(f"+{self.config.config.skip_seconds}秒")
 
     def skip_backward(self):
-        self.ctrl.skip_backward(self.config.config.skip_seconds)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            try:
+                engine.seek_rel(-self.config.config.skip_seconds)
+            except Exception as e:
+                logger.error("スキップエラー: %s", e)
         self._log_action(f"-{self.config.config.skip_seconds}秒")
 
     def next_track(self):
-        # 表示中トラック一覧の並びを優先（Issue #35: コントローラーがプレイヤー）。
-        # 一覧で扱えない場合のみ iTunes 側のプレイリスト順/キューにフォールバック
+        # 表示中トラック一覧の並びが「プレイヤーの再生順」（Issue #35/#39）
         if not self._play_adjacent_in_list(1):
-            playlist = getattr(self, "_playback_playlist", None)
-            # フォールバックの遷移先は不明なため自然終了補正の対象外にする（Issue #37）
-            self._suppress_track_correction = True
-            if getattr(self, "_com_task_queue", None) is not None:
-                self._com_submit("play_next_track", playlist)
-            else:
-                self.ctrl.play_next_track(playlist)
+            self._log_action("次の曲がありません")
+            return
         self._log_action("次の曲")
 
     def prev_track(self):
         if not self._play_adjacent_in_list(-1):
-            playlist = getattr(self, "_playback_playlist", None)
-            self._suppress_track_correction = True
-            if getattr(self, "_com_task_queue", None) is not None:
-                self._com_submit("play_previous_track", playlist)
-            else:
-                self.ctrl.play_previous_track(playlist)
+            self._log_action("前の曲がありません")
+            return
         self._log_action("前の曲")
 
     def _play_adjacent_in_list(self, direction: int) -> bool:
         """表示中トラック一覧の並びで隣接行を再生する。扱えたら True。
 
         コントローラー利用中はこの一覧が「プレイヤーの再生順」なので、
-        iTunes 側のキューや PlayOrderIndex ではなく表示順（列ソート後を含む）に
-        従う（Issue #35）。プレイリスト列挙も行わないため高速。
+        表示順（列ソート後を含む）に従う（Issue #35）。
         """
         try:
-            if getattr(self, "_com_task_queue", None) is None:
-                return False
             info = getattr(self, "_latest_track_info", None) or {}
             dbid = info.get("dbid")
             if dbid is None:
@@ -1186,49 +1143,60 @@ class ITunesTkApp:
         return ids
 
     def _play_tree_item(self, item) -> bool:
-        """track_tree の行を COM ワーカー経由で再生する。投入できれば True。
+        """track_tree の行をローカル再生エンジンで再生する。再生開始できれば True。
 
-        iTunes 側のキュー/コンテキストは意図的に確立しない（Issue #35: この一覧が
-        プレイヤーの再生順）。ライブラリ Search + Play の軽量経路を使うため
-        play_track_by_ids の playlist_name/play_order には None を渡す。
+        行の loc: タグ（iTunes XML の Location URL）をローカルパスに変換して
+        mpv で再生する。ファイルパスを持たない行（クラウド/未ダウンロード）は
+        再生不可として False。
         """
         ids = self._track_ids_from_item(item)
         name = self.track_tree.item(item, 'text') or None
-        playlist = getattr(self, "_track_loading_playlist", None)
-        if ids['pid'] or ids['dbid'] is not None:
-            self._com_submit(
-                "play_track_by_ids",
-                ids['source_id'], ids['playlist_id'], ids['track_id'],
-                ids['dbid'], ids['pid'], name, None, None,
-                _result_tag=("play_track", name, playlist),
-            )
-            # 遷移先の dbid を記録し自然終了補正の対象外にする（Issue #37）
-            self._expected_dbid = ids['dbid']
-            return True
-        if ids['location']:
-            self._com_submit(
-                "play_track_by_location", ids['location'],
-                _result_tag=("play_track", name, playlist),
-            )
-            # 遷移先 dbid が不明なため補正対象外にする
-            self._suppress_track_correction = True
-            return True
-        return False
+        path = itunes_location_to_path(ids.get('location'))
+        if not path:
+            self._log_action(f"再生不可（ファイルなし）: {name or '-'}")
+            return False
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            self._log_action("再生エンジンがありません")
+            return False
+        try:
+            engine.play(path)
+        except Exception as e:
+            logger.error("再生開始失敗: %s", e)
+            self._log_action(f"再生失敗: {name or '-'}")
+            return False
+        # 再生中の行のメタ情報を記録（表示・遷移・ハイライトの基準）
+        meta = dict(getattr(self, "_track_tree_item_meta", {}).get(item) or {})
+        meta["dbid"] = ids.get("dbid")
+        self._current_track_meta = meta
+        self._playback_playlist = getattr(self, "_track_loading_playlist", None)
+        self._log_action(f"トラック再生: {name or '-'}")
+        return True
 
     def add_to_slot(self, idx: int):
         widget_idx = idx % self.bank_size
         if 0 <= idx < len(self.quick_slots):
             name = self.quick_slots[idx]
+            # コントローラーがプレイヤーなので「再生中の曲」はローカルエンジン側の
+            # トラック（Issue #39）。dbid と曲名でライブラリ内トラックを特定する
+            meta = getattr(self, "_current_track_meta", None) or {}
+            dbid = meta.get("dbid")
+            track_name = meta.get("name")
+            if dbid is None:
+                self._log_action("再生中のトラックがありません")
+                self._flash_slot(widget_idx, "warning")
+                return
             # COM呼出しはワーカーへ委譲してUIスレッドをブロックしない（#5/#33）。
             # ワーカー無し時のみ従来通り直接呼出しにフォールバック
             if getattr(self, "_com_task_queue", None) is not None:
                 self._com_submit(
-                    "add_to_playlist", name,
+                    "add_to_playlist", name, dbid, track_name,
                     _result_tag=("add_to_playlist", name, widget_idx),
                 )
             else:
                 self._apply_add_result(
-                    name, widget_idx, self.ctrl.add_to_playlist(name)
+                    name, widget_idx,
+                    self.ctrl.add_to_playlist(name, dbid, track_name)
                 )
         else:
             self._log_action("未設定スロット")
@@ -1433,17 +1401,10 @@ class ITunesTkApp:
             if not selection:
                 return
             playlist_name = self._playlist_raw_names[selection[0]]
-            
-            # 即座に再生を開始（COM呼出しはワーカースレッドへ委譲しUIをブロックしない）
-            if hasattr(self.ctrl, 'play_playlist'):
-                self._com_submit(
-                    "play_playlist", playlist_name,
-                    _result_tag=("play_playlist", playlist_name),
-                )
-                # 遷移先 dbid が不明なため自然終了補正の対象外にする（Issue #37）
-                self._suppress_track_correction = True
-            
-            # トラック一覧の読み込み（バックグラウンド）
+
+            # トラック一覧の読み込み（バックグラウンド）。初回バッチが届いたら
+            # 先頭行を再生する（_display_tracks_batch_sync で _pending_autoplay を消費）
+            self._pending_autoplay = playlist_name
             self.load_tracks(playlist_name)
             self._log_action(f"プレイリスト再生・選択: {playlist_name}")
         except Exception as e:
@@ -1589,6 +1550,9 @@ class ITunesTkApp:
             # ワーカー完了: 保存されたdbidでトラックをハイライト
             if self._track_loading_dbid is not None:
                 self._highlight_track_by_dbid(self._track_loading_dbid)
+            # 行が1件も無かった等で自動再生が発火しなかった保留分をクリア
+            if getattr(self, "_pending_autoplay", None) == self._track_loading_playlist:
+                self._pending_autoplay = None
 
     def _display_tracks_batch_sync(self, tracks, current_dbid, cancel_event=None):
         """トラックのバッチをUIに表示（同期実行）。cancel_eventは呼出し世代のものを渡す"""
@@ -1655,6 +1619,14 @@ class ITunesTkApp:
             except Exception:
                 pass
 
+        # プレイリスト選択時の先頭曲自動再生（on_playlist_select で保留した分）
+        pending = getattr(self, "_pending_autoplay", None)
+        if pending is not None and pending == getattr(self, "_track_loading_playlist", None):
+            children = self.track_tree.get_children('')
+            if children:
+                self._pending_autoplay = None
+                self._play_tree_item(children[0])
+
     def _format_track_date(self, dt) -> str:
         try:
             if dt is None:
@@ -1707,39 +1679,7 @@ class ITunesTkApp:
             selection = self.track_tree.selection()
             if not selection:
                 return
-            item = selection[0]
-            ids = self._track_ids_from_item(item)
-
-            track_name = self.track_tree.item(item, 'text') or None
-            current_playlist = self._track_loading_playlist
-            submitted = False
-            if ids['pid'] or ids['dbid'] is not None:
-                # COM再生呼出し(PlayFirstTrack+sleepを含む)はワーカーへ委譲し、
-                # 結果は result_tag 経由でUIへ反映する（UIスレッドをブロックしない）
-                self._com_submit(
-                    "play_track_by_ids",
-                    ids['source_id'], ids['playlist_id'], ids['track_id'],
-                    ids['dbid'], ids['pid'], track_name,
-                    current_playlist, ids['play_order'],
-                    _result_tag=("play_track", track_name, current_playlist),
-                )
-                submitted = True
-                # 遷移先の dbid を記録し自然終了補正の対象外にする（Issue #37）
-                self._expected_dbid = ids['dbid']
-            elif ids['location']:
-                fn = getattr(self.ctrl, 'play_track_by_location', None)
-                if callable(fn):
-                    self._com_submit(
-                        "play_track_by_location", ids['location'],
-                        _result_tag=("play_track", track_name),
-                    )
-                    submitted = True
-                    self._suppress_track_correction = True
-
-            if submitted:
-                self._log_action(f"トラック再生要求: {track_name or '-'}")
-            else:
-                self._log_action("トラック再生失敗")
+            self._play_tree_item(selection[0])
         except Exception as e:
             logger.error("トラック選択エラー: %s", e)
 
@@ -2012,16 +1952,15 @@ class ITunesTkApp:
             self.progress_bar.set(value)
         except Exception:
             pass
-        # command= コールバックと同じ経路（_seeking ガード→デバウンス→COMワーカー）
+        # command= コールバックと同じ経路（_seeking ガード→デバウンス→エンジン）
         # set() 自体も -command を発火するが同じ値のため無害
         self.on_progress_change(value)
 
     def on_progress_change(self, value):
         """プログレスバー変更時。
 
-        ドラッグ中のモーションイベントごとに同期COM(get_current_track_info /
-        set_player_position)を呼ばないよう、after でデバウンスしてから
-        COMワーカー経由でシークを実行する。
+        ドラッグ中のモーションイベントごとにシークしないよう、
+        after でデバウンスしてからエンジンへ適用する。
         """
         if not self._seeking:
             return
@@ -2035,7 +1974,7 @@ class ITunesTkApp:
         self._seek_after_id = self._after(self.SEEK_DEBOUNCE_MS, self._flush_pending_seek)
 
     def _flush_pending_seek(self):
-        """デバウンス済みシークをCOMワーカーへ投入（発火済みコールバックの二重実行は無害）"""
+        """デバウンス済みシークを再生エンジンへ適用（発火済みコールバックの二重実行は無害）"""
         self._seek_after_id = None
         if self._closing:
             return
@@ -2043,7 +1982,7 @@ class ITunesTkApp:
         self._seek_pending_value = None
         if value is None:
             return
-        # 曲長はポーリング済みキャッシュから取得（UIスレッドでCOMを呼ばない）
+        # 曲長はエンジン状態のキャッシュから取得
         info = getattr(self, "_latest_track_info", None) or {}
         try:
             duration = float(info.get('duration') or 0)
@@ -2055,7 +1994,12 @@ class ITunesTkApp:
             position = float(value) * duration / 100.0
         except Exception:
             return
-        self._com_submit("set_player_position", position)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            try:
+                engine.seek_abs(position)
+            except Exception as e:
+                logger.error("シークエラー: %s", e)
 
     # --- 音量スライダー（シークバーと同じパターン） ---
 
@@ -2098,8 +2042,8 @@ class ITunesTkApp:
     def on_volume_change(self, value):
         """音量スライダー変更時。
 
-        ドラッグ中のモーションイベントごとにCOM呼出しをしないよう、
-        after でデバウンスしてからCOMワーカー経由で set_volume を実行する。
+        ドラッグ中のモーションイベントごとに音量を変えないよう、
+        after でデバウンスしてからエンジンへ適用する。
         """
         if not getattr(self, "_volume_seeking", False):
             return
@@ -2132,7 +2076,12 @@ class ITunesTkApp:
             level = max(0, min(100, int(round(float(value)))))
         except Exception:
             return
-        self._com_submit("set_volume", level)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            try:
+                engine.set_volume(level)
+            except Exception as e:
+                logger.error("音量設定エラー: %s", e)
 
     # トグルメソッド
     def toggle_slots(self):
@@ -2151,11 +2100,8 @@ class ITunesTkApp:
         """現在再生中のプレイリストとトラックに移動"""
         try:
             self._manual_playlist_view = False
-            # まずポーリング済みキャッシュを使い、無ければプラットフォーム共通APIで取得
             info = getattr(self, "_latest_track_info", None) or {}
-            playlist_name = info.get('playlist')
-            if not playlist_name:
-                playlist_name = self.ctrl.get_current_playlist_name()
+            playlist_name = info.get('playlist') or getattr(self, "_playback_playlist", None)
             if not playlist_name:
                 self._log_action("再生中のプレイリストがありません")
                 return
@@ -2190,28 +2136,6 @@ class ITunesTkApp:
             self._log_action(f"プレイリストへ移動: {playlist_name}")
         except Exception as e:
             logger.error("再生中の曲へ移動エラー: %s", e)
-
-    def _sync_to_itunes_state(self):
-        """iTunesの現在の再生状態をUIに反映する（起動直後用）。
-
-        COMワーカーのポーリング済みキャッシュのみ参照する。未取得なら何もしない
-        （次回以降のポーリング結果が _on_track_changed 経由で反映される）。
-        """
-        if self._closing:
-            return
-        try:
-            info = getattr(self, "_latest_track_info", None)
-            if not info:
-                return
-            cur_dbid = info.get('dbid')
-            cur_playlist = info.get('playlist')
-            if cur_dbid is None:
-                return
-            self._synced_dbid = cur_dbid
-            self._synced_playlist = cur_playlist
-            self._on_track_changed(cur_playlist, cur_dbid)
-        except Exception as e:
-            logger.error("起動時同期エラー: %s", e)
 
     def _on_track_changed(self, playlist_name: str | None, dbid: int | None):
         """曲が変わったときにUIのプレイリスト選択とトラックハイライトを更新する"""
@@ -2278,9 +2202,10 @@ class ITunesTkApp:
             base_interval = 1000
         next_interval = base_interval
         try:
-            # COMの同期呼出し(get_current_track_info)は行わない。
-            # COMワーカーが _ui_queue へ積んだポーリング結果を drain して反映する。
+            # ワーカーからのメッセージ（EOFイベント/タスク結果/ログ等）を drain し、
+            # ローカル再生エンジンの状態を読み取って表示へ反映する
             self._drain_ui_queue()
+            self._poll_engine()
 
             # BPM表示更新
             if self.bpm_value:
