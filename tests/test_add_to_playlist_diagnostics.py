@@ -11,7 +11,7 @@ import queue
 import threading
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -160,6 +160,64 @@ class TestAddToPlaylistFailureReasons:
         with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
             assert ctrl._find_playlist_by_name("PL") is None
         assert "enum fail" in caplog.text
+
+
+# --- 4. makepy 静的ラッパー（gen_py）環境での AddTrack ---
+
+class TestAddTrackMakepyFallback:
+    """PyInstaller exe では gen_py の静的ラッパーが有効になり、
+    Playlists.Item() が基底 IITPlaylist 型を返すため AddTrack が見えない。
+    その場合 IITUserPlaylist へ CastTo してから AddTrack を呼ぶ（実機確認済み）。"""
+
+    def _make_base_playlist(self):
+        """IITPlaylist 基底型を模倣: AddTrack を持たないプレイリスト"""
+        target = MagicMock(spec=["Name", "Tracks", "Search", "Play"])
+        target.Search.return_value = SimpleNamespace(Count=0)
+        return target
+
+    def test_castto_fallback_on_attributeerror(self):
+        ctrl = _make_windows_ctrl()
+        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
+        target = self._make_base_playlist()
+        ctrl._find_playlist_by_name = MagicMock(return_value=target)
+        casted = MagicMock(name="IITUserPlaylist")
+
+        with patch(
+            "music_controller_windows.win32com.client.CastTo",
+            return_value=casted,
+        ) as cast:
+            assert ctrl.add_to_playlist("PL") == "added"
+
+        cast.assert_called_once_with(target, "IITUserPlaylist")
+        casted.AddTrack.assert_called_once_with(ctrl.itunes.CurrentTrack)
+
+    def test_castto_failure_returns_false(self, caplog):
+        """CastTo 自体が失敗する対象（フォルダ等）は False + 理由ログ"""
+        ctrl = _make_windows_ctrl()
+        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
+        target = self._make_base_playlist()
+        ctrl._find_playlist_by_name = MagicMock(return_value=target)
+
+        with patch(
+            "music_controller_windows.win32com.client.CastTo",
+            side_effect=RuntimeError("not a user playlist"),
+        ):
+            with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
+                assert ctrl.add_to_playlist("PL") is False
+        assert "PL" in caplog.text
+
+    def test_addtrack_com_error_logged(self, caplog):
+        """AddTrack 呼出し自体の失敗（スマートプレイリスト等）は理由ログ付き False"""
+        ctrl = _make_windows_ctrl()
+        ctrl.itunes.CurrentTrack = SimpleNamespace(Name="n", TrackDatabaseID=1)
+        target = MagicMock(name="playlist")
+        target.Search.return_value = SimpleNamespace(Count=0)
+        target.AddTrack.side_effect = RuntimeError("read only playlist")
+        ctrl._find_playlist_by_name = MagicMock(return_value=target)
+
+        with caplog.at_level(logging.ERROR, logger="music_controller_windows"):
+            assert ctrl.add_to_playlist("PL") is False
+        assert "read only playlist" in caplog.text
 
 
 # --- 3. WARNING 以上のログがログ枠へ転送される ---

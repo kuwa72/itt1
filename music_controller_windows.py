@@ -587,10 +587,8 @@ class WindowsMusicController:
 
             if not track_name or not isinstance(track_dbid, int):
                 # 情報が不足している場合は追加のみ試みる
-                if hasattr(target, 'AddTrack'):
-                    target.AddTrack(current_track)
+                if self._add_track(target, current_track, playlist_name):
                     return "added"
-                logger.error("プレイリスト追加失敗: 対象がAddTrackをサポートしません: %s", playlist_name)
                 return False
 
             # Search APIで重複チェック（超高速: 0.04秒）
@@ -612,15 +610,39 @@ class WindowsMusicController:
                     pass
 
             # 重複なし → 追加
-            if hasattr(target, 'AddTrack'):
-                target.AddTrack(current_track)
+            if self._add_track(target, current_track, playlist_name):
                 return "added"
-
-            logger.error("プレイリスト追加失敗: 対象がAddTrackをサポートしません: %s", playlist_name)
             return False
 
         except Exception as e:
             logger.error("プレイリスト追加エラー (%s): %s", playlist_name, e)
+            return False
+
+    @staticmethod
+    def _add_track(target, current_track, playlist_name: str) -> bool:
+        """target.AddTrack(current_track) を呼ぶ。成功なら True。
+
+        PyInstaller exe では gen_py(makepy) の静的ラッパーが有効になり、
+        Playlists.Item() が基底 IITPlaylist 型を返すため AddTrack が見えない。
+        AttributeError 時は IITUserPlaylist へ CastTo してから再試行する。
+        """
+        try:
+            target.AddTrack(current_track)
+            return True
+        except AttributeError:
+            pass
+        except Exception as e:
+            logger.error("プレイリスト追加エラー (%s): %s", playlist_name, e)
+            return False
+        try:
+            casted = win32com.client.CastTo(target, "IITUserPlaylist")
+            casted.AddTrack(current_track)
+            return True
+        except Exception as e:
+            logger.error(
+                "プレイリスト追加失敗: 対象にAddTrackがありません: %s (%s)",
+                playlist_name, e,
+            )
             return False
     
     
