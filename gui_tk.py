@@ -1202,12 +1202,11 @@ class ITunesTkApp:
                     self.add_to_slot(idx)
                     return "break"
 
-            is_ctrl = bool(event.state & 0x4)
-            eff_bank = 1 if is_ctrl else self.slot_bank
-            # スロットキーは keysym 名ではなく文字で判定（JIS の ^ @ : ] も効く）
+            # スロットキーは keysym 名ではなく文字で判定（JIS の ^ @ : ] も効く）。
+            # Ctrl+キーでのブラインド追加は廃止（peek+キーを使う。Issue #55）
             slot_key = ch if is_printable else k
-            if slot_key in self.slot_keys:
-                idx = eff_bank * self.bank_size + self.slot_keys.index(slot_key)
+            if slot_key in self.slot_keys and not (event.state & 0x4):
+                idx = self.slot_bank * self.bank_size + self.slot_keys.index(slot_key)
                 self.add_to_slot(idx)
                 return "break"
             if k == ',':
