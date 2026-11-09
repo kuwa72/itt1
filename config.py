@@ -49,6 +49,11 @@ class AppConfig(BaseModel):
         description="終了時のウィンドウジオメトリ（例: '1040x860+100+50'。空は未保存）"
     )
 
+    keyboard_layout: str = Field(
+        default="us",
+        description="キーボードレイアウト（'us' or 'jis'）。スロットキーの表示と判定に使う"
+    )
+
 
 class ConfigManager:
     """設定ファイル管理"""
@@ -95,6 +100,16 @@ class ConfigManager:
     def set_window_geometry(self, geometry: str):
         """ウィンドウジオメトリを設定して保存"""
         self.config.window_geometry = geometry
+        self.save_config()
+
+    def get_keyboard_layout(self) -> str:
+        """キーボードレイアウト（'us' or 'jis'）を返す"""
+        layout = (self.config.keyboard_layout or "us").lower()
+        return layout if layout in ("us", "jis") else "us"
+
+    def set_keyboard_layout(self, layout: str):
+        """キーボードレイアウトを設定して保存"""
+        self.config.keyboard_layout = layout
         self.save_config()
 
     def _detect_platform_name(self) -> str:
