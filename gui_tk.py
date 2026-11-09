@@ -109,10 +109,30 @@ class ITunesTkApp:
     SEEK_DEBOUNCE_MS = 150
     # アクションログの保持件数（直近 N 件。超過分は古い行から削除）
     ACTION_LOG_MAX_ENTRIES = 50
+    # スロットキー列（物理キー順。表示ラベル兼ホットキー判定。Issue #53）
+    SLOT_KEY_ROWS = {
+        "us": "1234567890-=" + "qwertyuiop[]\\" + "asdfghjkl;'",
+        "jis": "1234567890-^" + "qwertyuiop@[" + "asdfghjkl;:]",
+    }
+    # peek中(Shift併用)の文字 → スロットキー変換（レイアウト別）。
+    # 文字が出ないキー（JIS Shift+0等）は _keycode_to_slot_key でフォールバック
+    SLOT_UNSHIFT = {
+        "us": {
+            "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+            "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
+            "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'",
+        },
+        "jis": {
+            "!": "1", '"': "2", "#": "3", "$": "4", "%": "5", "&": "6",
+            "'": "7", "(": "8", ")": "9", "=": "-", "~": "^",
+            "`": "@", "{": "[", "+": ";", "*": ":", "}": "]",
+        },
+    }
     # 終了処理中フラグ / モーダルダイアログ表示カウント。
     # クラス既定値を置き、__init__ 未到達のインスタンスでも on_key 等が安全に参照できるようにする
     _closing: bool = False
     _modal_open: int = 0
+    _peeking_bank: int | None = None
     # 初期ウィンドウサイズ/最小サイズ。クイックスロット枠（36ボタン/バンク、
     # 高さ固定の Label 行）とログ枠が初期表示で収まる寸法を確保する
     DEFAULT_GEOMETRY = "1040x860"
@@ -180,9 +200,11 @@ class ITunesTkApp:
         self._track_tree_order: List[str] = []
         self.tap_times: List[float] = []
         self.bpm_value: float | None = None
-        # ASCII keyboard top 3 rows: number row + QWERTY + ASDF (per-page)
-        self.slot_keys: List[str] = list("1234567890-=") + list("qwertyuiop[]\\") + list("asdfghjkl;'")
+        # スロットキー列はキーボードレイアウト設定に従う（Issue #53）
+        self.keyboard_layout = self.config.get_keyboard_layout()
+        self.slot_keys: List[str] = list(self.SLOT_KEY_ROWS[self.keyboard_layout])
         self.bank_size = len(self.slot_keys)
+        self._unshift_map = self.SLOT_UNSHIFT[self.keyboard_layout]
         self.slot_bank = 0
         # Shift ホールド中に一時表示しているバンク（None=通常表示）
         self._peeking_bank: int | None = None
@@ -303,6 +325,15 @@ class ITunesTkApp:
         view_menu.add_checkbutton(label="クイックスロット", variable=self.show_slots, command=self.toggle_slots)
         view_menu.add_checkbutton(label="ログ", variable=self.show_log, command=self.toggle_log)
         view_menu.add_checkbutton(label="ヘルプ", variable=self.help_visible, command=self.toggle_help)
+        # キーボードレイアウト選択（スロットキーの表示・判定を物理キーに合わせる。Issue #53）
+        kb_menu = tk.Menu(view_menu, tearoff=0)
+        view_menu.add_cascade(label="キーボード", menu=kb_menu)
+        self._kb_layout_var = tk.StringVar(value=self.keyboard_layout)
+        for code, label in (("us", "US（英語配列）"), ("jis", "JIS（日本語配列）")):
+            kb_menu.add_radiobutton(
+                label=label, value=code, variable=self._kb_layout_var,
+                command=self._apply_keyboard_layout,
+            )
         
         nav_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="移動", menu=nav_menu)
@@ -536,8 +567,8 @@ class ITunesTkApp:
         
         help_text = (
             "Space再生/停止 ←→スキップ ↑↓曲送り  "
-            "上3段キーでスロット追加  Ctrl+上3段:バンク2  ,/.:バンク固定切替  "
-            "b:スロット割当  v:プレイリスト一覧更新  c:プレイリスト作成"
+            "上3段キーでスロット追加  Shift:裏バンク表示  Shift+キー:裏バンクへ追加  "
+            ",/.:バンク切替  b:スロット割当  v:プレイリスト一覧更新  c:プレイリスト作成"
         )
         self.help_label = ttk.Label(self.help_frame, text=help_text, justify=tk.LEFT, font=("", 10))
         self.help_label.pack(anchor="w", padx=6, pady=(0, 4))
@@ -1112,6 +1143,26 @@ class ITunesTkApp:
         self._peeking_bank = None
         self.update_slot_labels()
 
+    @staticmethod
+    def _keycode_to_slot_key(keycode):
+        """Windows VK → 英数字キー。レイアウト非依存の物理キー判定用"""
+        if 0x30 <= keycode <= 0x39 or 0x41 <= keycode <= 0x5A:
+            return chr(keycode).lower()
+        return None
+
+    def _apply_keyboard_layout(self):
+        """メニューで選んだレイアウトを反映して config に保存する"""
+        layout = self._kb_layout_var.get()
+        if layout not in self.SLOT_KEY_ROWS:
+            layout = "us"
+        self.keyboard_layout = layout
+        self.slot_keys = list(self.SLOT_KEY_ROWS[layout])
+        self.bank_size = len(self.slot_keys)
+        self._unshift_map = self.SLOT_UNSHIFT[layout]
+        self.config.set_keyboard_layout(layout)
+        self.update_slot_labels()
+        self._log_action(f"キーボード: {layout.upper()}")
+
     def toggle_slot_bank(self):
         self.slot_bank = 0 if self.slot_bank else 1
         self.update_slot_labels()
@@ -1134,10 +1185,29 @@ class ITunesTkApp:
             if k == 'g' and (event.state & 0x4):
                 self.goto_current_track(); return "break"
 
+            # peek 中（Shift押下で裏バンク表示中）のスロットキーは裏バンクへ直接追加。
+            # Shift 併用で文字が変わるため unshift 表 + 物理キー(keycode)で特定する
+            ch = getattr(event, "char", "") or ""
+            is_printable = len(ch) == 1 and ch.isprintable()
+            if self._peeking_bank is not None:
+                pk = None
+                if is_printable:
+                    pk = self._unshift_map.get(ch)
+                    if pk is None and ch.isalpha():
+                        pk = ch.lower()
+                if pk is None:
+                    pk = self._keycode_to_slot_key(getattr(event, "keycode", 0))
+                if pk in self.slot_keys:
+                    idx = self._peeking_bank * self.bank_size + self.slot_keys.index(pk)
+                    self.add_to_slot(idx)
+                    return "break"
+
             is_ctrl = bool(event.state & 0x4)
             eff_bank = 1 if is_ctrl else self.slot_bank
-            if k in self.slot_keys:
-                idx = eff_bank * self.bank_size + self.slot_keys.index(k)
+            # スロットキーは keysym 名ではなく文字で判定（JIS の ^ @ : ] も効く）
+            slot_key = ch if is_printable else k
+            if slot_key in self.slot_keys:
+                idx = eff_bank * self.bank_size + self.slot_keys.index(slot_key)
                 self.add_to_slot(idx)
                 return "break"
             if k == ',':
