@@ -184,6 +184,8 @@ class ITunesTkApp:
         self.slot_keys: List[str] = list("1234567890-=") + list("qwertyuiop[]\\") + list("asdfghjkl;'")
         self.bank_size = len(self.slot_keys)
         self.slot_bank = 0
+        # Shift ホールド中に一時表示しているバンク（None=通常表示）
+        self._peeking_bank: int | None = None
         # 表示状態
         self.show_slots = tk.BooleanVar(value=True)
         self.show_log = tk.BooleanVar(value=True)
@@ -555,6 +557,10 @@ class ITunesTkApp:
 
     def bind_keys(self):
         self.root.bind_all("<KeyPress>", self.on_key)
+        # Shift ホールド中は裏バンクのスロットを peek 表示（Issue #49）
+        for side in ("Shift_L", "Shift_R"):
+            self.root.bind_all(f"<KeyPress-{side}>", self._peek_slot_bank)
+            self.root.bind_all(f"<KeyRelease-{side}>", self._unpeek_slot_bank)
 
     def _after(self, ms: int, func, *args):
         """root.after のラッパー。返された ID を _pending_after_ids に記録し、
@@ -1053,11 +1059,13 @@ class ITunesTkApp:
         }
         return alias.get(k, keysym)
 
-    def update_slot_labels(self):
-        base = self.slot_bank * self.bank_size
+    def update_slot_labels(self, bank: int | None = None):
+        if bank is None:
+            bank = self.slot_bank
+        base = bank * self.bank_size
 
         try:
-            self.slots_page_label.configure(text=f"バンク: {self.slot_bank + 1}/2")
+            self.slots_page_label.configure(text=f"バンク: {bank + 1}/2")
         except Exception:
             pass
 
@@ -1070,6 +1078,22 @@ class ITunesTkApp:
                 lbl.configure(text=f"{key_label}\n{name}", fg=self._slot_default_fg, bg=self._slot_default_bg)
             else:
                 lbl.configure(text=f"{key_label}\n(未設定)", fg=self._slot_empty_fg, bg=self._slot_default_bg)
+
+    def _peek_slot_bank(self, event=None):
+        """Shift 押下中: 裏バンクの内容を一時表示する（追加対象の slot_bank は変えない）"""
+        if self._closing or getattr(self, "_modal_open", 0):
+            return
+        if self._peeking_bank is not None:
+            return  # 左右 Shift の連続 KeyPress で二度描画しない
+        self._peeking_bank = 1 - self.slot_bank
+        self.update_slot_labels(self._peeking_bank)
+
+    def _unpeek_slot_bank(self, event=None):
+        """Shift 解放: 現在バンクの表示に戻す"""
+        if self._peeking_bank is None:
+            return
+        self._peeking_bank = None
+        self.update_slot_labels()
 
     def toggle_slot_bank(self):
         self.slot_bank = 0 if self.slot_bank else 1
