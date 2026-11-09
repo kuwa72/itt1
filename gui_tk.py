@@ -863,7 +863,11 @@ class ITunesTkApp:
             except Exception:
                 pass
         playing = info.get('is_playing', False)
-        self.track_status.configure(text=("▶ 再生中" if playing else "⏸ 一時停止"))
+        # 再生中の曲が表示中一覧の何番目か（一覧に無い・停止中は付けない。Issue #50）
+        status_text = "▶ 再生中" if playing else "⏸ 一時停止"
+        if playing:
+            status_text += self._track_position_suffix(info.get('dbid'))
+        self.track_status.configure(text=status_text)
         self.track_title.configure(text=f"曲名: {info.get('name', '-')}")
         self.track_artist.configure(text=f"アーティスト: {info.get('artist', '-')}")
         self.track_album.configure(text=f"アルバム: {info.get('album', '-')}")
@@ -887,6 +891,19 @@ class ITunesTkApp:
             self._synced_dbid = cur_dbid
             self._synced_playlist = cur_playlist
             self._on_track_changed(cur_playlist, cur_dbid)
+
+    def _track_position_suffix(self, dbid) -> str:
+        """再生中 dbid が表示中一覧にあれば ' (N/M)'、無ければ '' を返す"""
+        if dbid is None:
+            return ""
+        try:
+            items = list(self.track_tree.get_children(''))
+            for pos, iid in enumerate(items):
+                if self._item_dbid(iid) == dbid:
+                    return f" ({pos + 1}/{len(items)})"
+        except Exception:
+            pass
+        return ""
 
     def _play_next_row_after(self, ended_dbid) -> bool:
         """終了した曲の一覧上の次の行を再生する。
