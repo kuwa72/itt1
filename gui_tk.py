@@ -222,6 +222,9 @@ class ITunesTkApp:
         self._track_loading_queue: "queue.Queue[list[dict]] | None" = None
         self._track_loading_playlist: str | None = None
         self._track_loading_dbid: int | None = None
+        # セッション復元（起動時に前回の再生曲へ seek + 一時停止。Issue #56）
+        self._pending_resume: dict | None = None
+        self._session_restored: bool = False
         # 読み込み世代番号（load_tracks ごとにインクリメント。ワーカー/キュー/ポーラーを世代に紐付ける）
         self._track_load_generation: int = 0
         # 手動選択による表示中は再生中プレイリストへの自動追従を抑止するフラグ
@@ -976,6 +979,21 @@ class ITunesTkApp:
         except Exception:
             pass
 
+        # セッション状態を保存（次回起動時に復元。Issue #56）
+        try:
+            info = getattr(self, "_latest_track_info", None) or {}
+            meta = getattr(self, "_current_track_meta", None) or {}
+            volume = info.get("volume")
+            self.config.set_last_session(
+                playlist=getattr(self, "_track_loading_playlist", None)
+                or getattr(self, "_now_playing_playlist", None),
+                dbid=meta.get("dbid"),
+                position=info.get("position"),
+                volume=int(volume) if volume is not None else -1,
+            )
+        except Exception:
+            pass
+
         # ログ枠転送ハンドラを外す（終了後にレコードがキューへ積まれ続けないように）
         try:
             handler = getattr(self, "_ui_log_handler", None)
@@ -1661,8 +1679,58 @@ class ITunesTkApp:
             for pl in playlists:
                 self._playlist_raw_names.append(pl['name'])
             self._rebuild_playlist_listbox(preserve_selection=False)
+            self._restore_last_session()
         except Exception as e:
             logger.error("プレイリスト読み込みエラー: %s", e)
+
+    def _restore_last_session(self):
+        """起動時1回: 前回終了時のプレイリスト・曲・音量・再生位置を復元する（Issue #56）"""
+        if self._session_restored:
+            return
+        self._session_restored = True
+        try:
+            session = self.config.get_last_session()
+        except Exception:
+            return
+        playlist = session.get("playlist")
+        if not playlist:
+            return
+        try:
+            idx = self._playlist_raw_names.index(playlist)
+        except ValueError:
+            return
+        try:
+            self.playlist_listbox.selection_set(idx)
+        except Exception:
+            pass
+        dbid = session.get("dbid") or 0
+        if dbid:
+            self._track_loading_dbid = dbid
+            self._pending_resume = {
+                "dbid": dbid,
+                "position": session.get("position") or 0.0,
+            }
+        vol = session.get("volume")
+        engine = getattr(self, "engine", None)
+        if engine is not None and vol is not None and vol >= 0:
+            try:
+                engine.set_volume(vol)
+            except Exception:
+                pass
+        self.load_tracks(playlist)
+
+    def _finish_resume_seek(self, position):
+        """セッション復元のシーク＋一時停止（再生開始待ちの遅延実行）"""
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        try:
+            if position and position > 0:
+                engine.seek_abs(position)
+            if engine.get_state().get("is_playing"):
+                engine.toggle_pause()
+        except Exception as e:
+            logger.error("再生位置復元エラー: %s", e)
 
     def _refresh_playlist_labels(self):
         """表示中プレイリスト一覧のラベルをキャッシュ済みXML情報で更新する（COM不使用）。
@@ -2007,6 +2075,19 @@ class ITunesTkApp:
             if children:
                 self._pending_autoplay = None
                 self._play_tree_item(children[0])
+
+        # セッション復元: 前回再生中の曲を位置復元つきで再生（Issue #56）
+        resume = getattr(self, "_pending_resume", None)
+        if resume is not None:
+            for iid in self.track_tree.get_children(''):
+                if self._item_dbid(iid) == resume["dbid"]:
+                    self._pending_resume = None
+                    if self._play_tree_item(iid):
+                        self._after(
+                            400, self._finish_resume_seek,
+                            resume.get("position") or 0.0,
+                        )
+                    break
 
     def _format_track_date(self, dt) -> str:
         try:

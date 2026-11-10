@@ -54,6 +54,11 @@ class AppConfig(BaseModel):
         description="キーボードレイアウト（'us' or 'jis'）。スロットキーの表示と判定に使う"
     )
 
+    last_playlist: str = Field(default="", description="終了時に表示/再生していたプレイリスト名")
+    last_track_dbid: int = Field(default=0, description="終了時に再生中だったトラックの DatabaseID（0=なし）")
+    last_position: float = Field(default=0.0, description="終了時の再生位置（秒）")
+    last_volume: int = Field(default=-1, description="終了時の音量 0-100（-1=未保存）")
+
 
 class ConfigManager:
     """設定ファイル管理"""
@@ -110,6 +115,23 @@ class ConfigManager:
     def set_keyboard_layout(self, layout: str):
         """キーボードレイアウトを設定して保存"""
         self.config.keyboard_layout = layout
+        self.save_config()
+
+    def get_last_session(self) -> dict:
+        """終了時に保存したセッション状態を返す"""
+        return {
+            "playlist": self.config.last_playlist or "",
+            "dbid": self.config.last_track_dbid or 0,
+            "position": self.config.last_position or 0.0,
+            "volume": self.config.last_volume,
+        }
+
+    def set_last_session(self, playlist=None, dbid=None, position=None, volume=None):
+        """セッション状態を設定して保存"""
+        self.config.last_playlist = playlist or ""
+        self.config.last_track_dbid = dbid or 0
+        self.config.last_position = position or 0.0
+        self.config.last_volume = volume if volume is not None else -1
         self.save_config()
 
     def _detect_platform_name(self) -> str:
